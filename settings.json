@@ -1,0 +1,22 @@
+{
+  "api": {
+    "timeout_seconds": 60.0,
+    "max_retries": 0
+  },
+  "generation": {
+    "max_completion_tokens": 4096,
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
+  "execution": {
+    "max_api_calls_per_turn": 16,
+    "max_steps_per_agent": 8,
+    "reserved_director_calls": 2,
+    "final_answer_target_tokens": 2800,
+    "max_delegated_task_characters": 20000
+  },
+  "roles": {
+    "director": { "max_delegations": 2 },
+    "worker": { "max_delegations": 0 }
+  }
+}

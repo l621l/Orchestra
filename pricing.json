@@ -1,0 +1,20 @@
+{
+  "currency": "USD",
+  "unit_tokens": 1000000,
+  "source": "https://mimo.mi.com/docs/pricing",
+  "updated": "2026-09-22",
+  "providers": {
+    "mimo": {
+      "mimo-v2.6-pro": {
+        "input_cache_hit": 0.0036,
+        "input_cache_miss": 0.435,
+        "output": 0.87
+      },
+      "mimo-v2.6-flash": {
+        "input_cache_hit": 0.0028,
+        "input_cache_miss": 0.14,
+        "output": 0.28
+      }
+    }
+  }
+}
