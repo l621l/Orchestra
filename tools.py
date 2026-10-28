@@ -4,7 +4,17 @@ import fnmatch
 import hashlib
 import json
 import os
+import time
+import uuid
+from collections import OrderedDict
+from threading import Lock
+from functools import lru_cache
+from tool_errors import ToolError
 from pathlib import Path
+
+import regex as regex_engine
+from workspace_policy import WorkspacePolicy
+from tool_contracts import validate_arguments
 
 
 def definition(name, description, properties, required):
@@ -15,71 +25,110 @@ def definition(name, description, properties, required):
 
 
 FILE_TOOLS = [
-    definition("list_files", "Show a compact recursive project tree. Start near the project root with depth 3, then inspect only relevant subtrees. Hidden files, secrets, dependencies and generated build folders are excluded. Results are capped and report continuation paths when truncated.",
+    definition("list_files", "List a bounded project tree with continuation paths. Restricted paths and common dependency/build directories are excluded.",
                {"path": {"type": "string", "description": "Relative directory path; use . for the root."},
                 "max_depth": {"type": "integer", "minimum": 1, "maximum": 6,
                               "description": "Recursive levels to show; default 3."},
                 "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000,
                                 "description": "Maximum files and directories; default 400."}}, ["path"]),
-    definition("read_file", "Read a UTF-8 project file, optionally selecting an inclusive line range. Output is limited to 200 lines and 20000 characters.",
+    definition("read_file", "Read a UTF-8 file with 1-based line numbers and inclusive ranges. Defaults to 200 lines; returns whole lines within 20,000 characters and a continuation line. A single oversized line returns line_too_long; use search for a snippet.",
                {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1},
                 "end_line": {"type": "integer", "minimum": 1}}, ["path"]),
-    definition("search_text", "Search project text files for a literal string and return compact path:line:text matches. Use this before paging through large files. Secrets, dependencies, generated folders, binary files and files over 2 MB are excluded.",
+    definition("search_text", "Find literal text in accessible UTF-8 files up to 2 MB. Returns path:line snippets and a cursor over a saved snapshot (valid for up to 5 minutes, subject to eviction). Restart without a cursor for fresh results.",
                {"query": {"type": "string", "description": "Literal text to find; not a regular expression."},
                 "path": {"type": "string", "description": "Relative file or directory to search; default ."},
-                "file_pattern": {"type": "string", "description": "Optional glob such as *.vue or backend/**/*.cs."},
+                "file_pattern": {"type": "string", "description": "Case-sensitive glob: *.vue matches basenames at any depth; backend/**/*.cs matches root-relative paths, with ** matching zero or more directories."},
                 "case_sensitive": {"type": "boolean", "description": "Default false."},
                 "context_lines": {"type": "integer", "minimum": 0, "maximum": 5,
                                   "description": "Lines before and after each match; default 0."},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 500,
                                 "description": "Maximum matching lines on this page; default 100."},
-                "cursor": {"type": "string", "description": "Opaque next_cursor from an earlier identical search."}}, ["query"]),
+                "cursor": {"type": "string", "description": "next_cursor from the same search. Continues its saved snapshot; rerun without cursor if expired."}}, ["query"]),
+    definition("search_regex", "Find a regular expression independently on each line of accessible UTF-8 files up to 2 MB. Returns path:line snippets and a cursor over a saved snapshot (up to 5 minutes, subject to eviction). Use search_text for literals.",
+               {"pattern": {"type": "string", "description": "Regular expression matched independently against each line."},
+                "path": {"type": "string", "description": "Relative file or directory to search; default ."},
+                "file_pattern": {"type": "string", "description": "Case-sensitive glob: *.vue matches basenames at any depth; backend/**/*.cs matches root-relative paths, with ** matching zero or more directories."},
+                "case_sensitive": {"type": "boolean", "description": "Default false."},
+                "context_lines": {"type": "integer", "minimum": 0, "maximum": 5,
+                                  "description": "Lines before and after each match; default 0."},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 500,
+                                "description": "Maximum matching lines on this page; default 100."},
+                "cursor": {"type": "string", "description": "next_cursor from the same search. Continues its saved snapshot; rerun without cursor if expired."}}, ["pattern"]),
 ]
-DELEGATE_TOOL = definition("delegate_task", "Delegate a substantial, self-contained task to a worker with its own conversation and read-only project tools. Multiple calls returned together run concurrently. The worker does not receive your conversation automatically, so include all relevant requirements. Avoid delegation for simple repository inspection that you can complete directly.",
-                           {"task": {"type": "string"}}, ["task"])
+DELEGATE_TOOL = definition("delegate_task", "Start a worker with an isolated context. mode=research (default) reads/analyzes; mode=implementation edits and checks in a private Git worktree when enabled. Supply goal, scope, current interfaces, requirements and deliverable. Implementation workers need an initial commit; their changes are NOT automatically transferred. Budget sums must fit the allocatable pool. Collect results with wait_tasks; review/apply implementation changes separately.",
+                           {"task": {"type": "string"},
+                            "mode": {"type": "string", "enum": ["research", "implementation"],
+                                     "description": "research for investigation/review; implementation for isolated coding."},
+                            "max_calls": {"type": "integer", "minimum": 1,
+                                          "description": "Maximum model requests, including the final report; not individual tool executions."},
+                            "report_target_tokens": {"type": "integer", "minimum": 100,
+                                                     "description": "Target visible report length; not a hard token limit."}},
+                           ["task", "max_calls", "report_target_tokens"])
+WORKER_CHANGE_TOOLS = [
+    definition('review_task_changes', 'Review a finished implementation worker: changed paths, bounded diff and transfer fingerprint. Use path to inspect one changed file if truncated. This does not apply changes.',
+               {'task_id': {'type': 'string'}, 'path': {'type': 'string'}}, ['task_id']),
+    definition('apply_task_changes', 'Transfer a reviewed finished worker patch into the director workspace. Call alone using the review fingerprint. Refuses files changed since the worker snapshot and never overwrites a conflict. Then run director checks before committing; worker checks do not verify the combined result.',
+               {'task_id': {'type': 'string'}, 'fingerprint': {'type': 'string'}}, ['task_id', 'fingerprint']),
+]
+COMPARISON_TOOLS = [
+    definition('start_comparison_round', 'Start exactly two independent implementation workers with the SAME task and baseline. Call alone. Requires a clean committed director workspace and enough shared budget for both workers plus the director reserve. Collect both with wait_tasks and review both patches before choosing; director does not edit files in this mode.',
+               {'task': {'type': 'string', 'minLength': 1},
+                'max_calls_per_worker': {'type': 'integer', 'minimum': 2},
+                'report_target_tokens': {'type': 'integer', 'minimum': 100}},
+               ['task', 'max_calls_per_worker', 'report_target_tokens']),
+    definition('promote_candidate', 'Choose ONE complete worker result from the active comparison round. Call alone after both workers finish and both available patches are reviewed. Transfers its frozen patch, runs every configured director check and creates a local commit. The accepted commit becomes the baseline of the next round. Failed checks/commit trigger rollback of owned changes; inspect promoted/rolled_back and report failures. Never combines the two variants or pushes.',
+               {'round_id': {'type': 'string'}, 'task_id': {'type': 'string'},
+                'fingerprint': {'type': 'string'}, 'message': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
+                'rationale': {'type': 'string', 'minLength': 1, 'maxLength': 2000}},
+               ['round_id', 'task_id', 'fingerprint', 'message', 'rationale']),
+    definition('reject_comparison_round', 'Reject both finished alternatives and keep the current accepted baseline. Call alone with a concrete reason; then start a narrower or corrected round if budget permits. Does not delete worker worktrees.',
+               {'round_id': {'type': 'string'}, 'reason': {'type': 'string', 'minLength': 1, 'maxLength': 2000}},
+               ['round_id', 'reason']),
+]
+WAIT_TASKS_TOOL = definition(
+    "wait_tasks",
+    "Wait for worker results. Omit task_ids to select all workers in this turn. Returns execution and result status, including available drafts. A timeout does not cancel workers.",
+    {"task_ids": {"type": "array", "items": {"type": "string"},
+                  "description": "Optional delegated task IDs to wait for."},
+     "return_when": {"type": "string", "enum": ["any", "all"],
+                     "description": "Return after any selected task finishes or after all finish; default all."},
+     "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 120,
+                         "description": "Local wait timeout; default 60 seconds. This does not cancel workers."}},
+    [])
 
 
 class ProjectTools:
-    def __init__(self, root):
-        self.root = Path(root).resolve(strict=True)
-        if not self.root.is_dir():
-            raise ValueError("Workspace must be a directory.")
+    def __init__(self, root, policy=None):
+        self.policy = policy or WorkspacePolicy(root)
+        self.root = self.policy.root
+        self._search_snapshots = OrderedDict()
+        self._snapshot_lock = Lock()
 
     @staticmethod
     def allowed(parts):
-        return all(not p.startswith(".") and p.lower() not in {
-            "config.local.json", "node_modules", "venv", ".venv", "__pycache__",
-            "logs", "dist", "build", "bin", "obj", ".idea", ".vs", "coverage"
-        } and not p.lower().endswith((".pem", ".key", ".pfx")) for p in parts)
+        return WorkspacePolicy.parts_allowed(parts)
 
     def resolve(self, path):
-        if not isinstance(path, str) or Path(path).is_absolute():
-            raise ValueError("Use a relative project path.")
-        relative = Path(path)
-        if ".." in relative.parts or not self.allowed(relative.parts):
-            raise ValueError("Path is not accessible.")
-        target = (self.root / relative).resolve(strict=True)
-        if not target.is_relative_to(self.root) or not self.allowed(target.relative_to(self.root).parts):
-            raise ValueError("Path is outside the allowed project area.")
-        return target
+        return self.policy.resolve_read(path)
 
     def list_files(self, path, max_depth=3, max_entries=400):
         if type(max_depth) is not int or not 1 <= max_depth <= 6:
-            raise ValueError("max_depth must be an integer from 1 to 6.")
+            raise ToolError("invalid_arguments", "max_depth must be an integer from 1 to 6.")
         if type(max_entries) is not int or not 1 <= max_entries <= 1000:
-            raise ValueError("max_entries must be an integer from 1 to 1000.")
+            raise ToolError("invalid_arguments", "max_entries must be an integer from 1 to 1000.")
         target = self.resolve(path)
         if not target.is_dir():
-            raise ValueError("Path is not a directory.")
+            raise ToolError("invalid_arguments", "Path is not a directory.")
         lines = []
         continuation_paths = []
         directory_count = 0
         file_count = 0
+        output_characters = 0
         truncated = False
         visited = set()
 
         def scan(directory, depth):
-            nonlocal directory_count, file_count, truncated
+            nonlocal directory_count, file_count, output_characters, truncated
             resolved = directory.resolve()
             if resolved in visited:
                 return
@@ -106,12 +155,14 @@ class ProjectTools:
                 relative = str(child.relative_to(self.root))
                 is_directory = child.is_dir()
                 line = f"{'  ' * (depth - 1)}{child.name}{'/' if is_directory else ''}"
-                if sum(len(existing) + 1 for existing in lines) + len(line) > 20000:
+                added_characters = len(line) + (1 if lines else 0)
+                if output_characters + added_characters > 20000:
                     truncated = True
                     if relative not in continuation_paths:
                         continuation_paths.append(relative if is_directory else str(directory.relative_to(self.root)))
                     return
                 lines.append(line)
+                output_characters += added_characters
                 if is_directory:
                     directory_count += 1
                     if depth < max_depth:
@@ -131,15 +182,18 @@ class ProjectTools:
     def read_file(self, path, start_line=1, end_line=None):
         DEFAULT_LINES_PER_READ = 200
         if type(start_line) is not int or start_line < 1:
-            raise ValueError("start_line must be a positive integer.")
+            raise ToolError("invalid_range", "start_line must be a positive integer.")
         if end_line is not None and (type(end_line) is not int or end_line < start_line):
-            raise ValueError("end_line must be an integer >= start_line.")
+            raise ToolError("invalid_range", "end_line must be an integer >= start_line.")
         target = self.resolve(path)
         if not target.is_file() or target.stat().st_size > 2_000_000:
-            raise ValueError("Expected a text file no larger than 2 MB.")
-        text = target.read_text(encoding="utf-8")
+            raise ToolError("invalid_arguments", "Expected a text file no larger than 2 MB.")
+        try:
+            text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise ToolError('unsupported_encoding', 'read_file supports UTF-8 text. Use a UTF-8 source file.') from error
         if "\x00" in text:
-            raise ValueError("Binary files are not supported.")
+            raise ToolError("invalid_arguments", "Binary files are not supported.")
         lines = text.splitlines()
         if end_line is None:
             end = min(
@@ -148,46 +202,127 @@ class ProjectTools:
             )
         else:
             end = min(end_line, len(lines))
-        content = "\n".join(f"{i + 1}: {lines[i]}" for i in range(start_line - 1, end))
-        return {"path": path, "total_lines": len(lines), "content": content[:20000],
-                "truncated": len(content) > 20000 or end < min(end_line or len(lines), len(lines))}
+        rendered = []
+        characters = 0
+        last_line = None
+        for i in range(start_line - 1, end):
+            line = f"{i + 1}: {lines[i]}"
+            if characters + len(line) + bool(rendered) > 20000:
+                if not rendered:
+                    raise ToolError("line_too_long", "This line exceeds the read limit. Use search_text or search_regex for a bounded snippet.", line=i + 1)
+                break
+            characters += len(line) + bool(rendered)
+            rendered.append(line)
+            last_line = i + 1
+        requested_end = min(end_line if end_line is not None else len(lines), len(lines))
+        next_line = last_line + 1 if last_line is not None and last_line < requested_end else None
+        return {"path": path, "total_lines": len(lines), "content": "\n".join(rendered),
+                "returned_start_line": start_line if rendered else None,
+                "returned_end_line": last_line, "next_start_line": next_line,
+                "truncated": next_line is not None}
+
+    @staticmethod
+    def matches_glob(path, pattern):
+        """Basename patterns or slash-separated, root-relative path patterns."""
+        if "/" not in pattern:
+            return fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], pattern)
+        parts, patterns = path.split("/"), pattern.split("/")
+        @lru_cache(None)
+        def match(i, j):
+            if j == len(patterns):
+                return i == len(parts)
+            if patterns[j] == "**":
+                return match(i, j + 1) or (i < len(parts) and match(i + 1, j))
+            return i < len(parts) and fnmatch.fnmatchcase(parts[i], patterns[j]) and match(i + 1, j + 1)
+        return match(0, 0)
+
+    def _search_page(self, snapshot_id, snapshot, offset, max_results):
+        blocks = snapshot["blocks"]
+        if offset < 0 or offset > len(blocks):
+            raise ToolError("invalid_cursor", "Invalid search offset; restart without cursor.")
+        page, size, index = [], 0, offset
+        while index < len(blocks) and len(page) < max_results:
+            block = blocks[index]
+            if size + len(block) + (2 if page else 0) > 20000:
+                if not page:
+                    raise ToolError("result_too_large", "Search result exceeds the page limit; narrow the path or reduce context_lines.")
+                break
+            size += len(block) + (2 if page else 0)
+            page.append(block)
+            index += 1
+        has_more = index < len(blocks)
+        cursor = None
+        if has_more:
+            raw = json.dumps({"snapshot": snapshot_id, "fingerprint": snapshot["fingerprint"], "offset": index}).encode()
+            cursor = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        return {**snapshot["metadata"], "matches": "\n\n".join(page),
+                "matches_returned": len(page), "next_cursor": cursor,
+                "snapshot_id": snapshot_id,
+                "truncated": has_more or snapshot["metadata"]["collection_truncated"]}
 
     def search_text(self, query, path=".", file_pattern=None,
                     case_sensitive=False, context_lines=0, max_results=100,
                     cursor=None):
+        return self._search(query, path, file_pattern, case_sensitive,
+                            context_lines, max_results, cursor, regex=False)
+
+    def search_regex(self, pattern, path=".", file_pattern=None,
+                     case_sensitive=False, context_lines=0, max_results=100,
+                     cursor=None):
+        return self._search(pattern, path, file_pattern, case_sensitive,
+                            context_lines, max_results, cursor, regex=True)
+
+    def _search(self, query, path=".", file_pattern=None,
+                case_sensitive=False, context_lines=0, max_results=100,
+                cursor=None, regex=False):
         if not isinstance(query, str) or not 1 <= len(query) <= 500:
-            raise ValueError("query must be a string from 1 to 500 characters.")
+            raise ToolError("invalid_arguments", "query must be a string from 1 to 500 characters.")
         if not isinstance(path, str):
-            raise ValueError("path must be a relative string.")
+            raise ToolError("invalid_arguments", "path must be a relative string.")
         if file_pattern is not None and (not isinstance(file_pattern, str)
                                          or not 1 <= len(file_pattern) <= 200):
-            raise ValueError("file_pattern must be a string from 1 to 200 characters.")
+            raise ToolError("invalid_arguments", "file_pattern must be a string from 1 to 200 characters.")
         if type(case_sensitive) is not bool:
-            raise ValueError("case_sensitive must be a boolean.")
+            raise ToolError("invalid_arguments", "case_sensitive must be a boolean.")
         if type(context_lines) is not int or not 0 <= context_lines <= 5:
-            raise ValueError("context_lines must be an integer from 0 to 5.")
+            raise ToolError("invalid_arguments", "context_lines must be an integer from 0 to 5.")
         if type(max_results) is not int or not 1 <= max_results <= 500:
-            raise ValueError("max_results must be an integer from 1 to 500.")
+            raise ToolError("invalid_arguments", "max_results must be an integer from 1 to 500.")
         if cursor is not None and not isinstance(cursor, str):
-            raise ValueError("cursor must be a string.")
+            raise ToolError("invalid_arguments", "cursor must be a string.")
 
-        search_spec = json.dumps({"query": query, "path": path,
+        compiled_pattern = None
+        if regex:
+            try:
+                flags = 0 if case_sensitive else regex_engine.IGNORECASE
+                compiled_pattern = regex_engine.compile(query, flags)
+            except regex_engine.error as error:
+                raise ToolError("invalid_regex", "Invalid regular expression; check its syntax.") from error
+
+        search_spec = json.dumps({"mode": "regex" if regex else "literal",
+            "query": query, "path": path,
             "file_pattern": file_pattern, "case_sensitive": case_sensitive,
             "context_lines": context_lines}, sort_keys=True, ensure_ascii=False)
         fingerprint = hashlib.sha256(search_spec.encode("utf-8")).hexdigest()[:16]
-        offset = 0
         if cursor:
             try:
-                padding = "=" * (-len(cursor) % 4)
-                cursor_data = json.loads(base64.urlsafe_b64decode(cursor + padding))
-                if cursor_data != {"fingerprint": fingerprint,
-                                    "offset": cursor_data.get("offset")}:
-                    raise ValueError
-                offset = cursor_data["offset"]
-                if type(offset) is not int or offset < 0:
+                data = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+                if (set(data) != {"snapshot", "fingerprint", "offset"}
+                        or data["fingerprint"] != fingerprint
+                        or not isinstance(data["snapshot"], str)
+                        or type(data["offset"]) is not int):
                     raise ValueError
             except Exception as error:
-                raise ValueError("Invalid cursor for this search.") from error
+                raise ToolError("invalid_cursor", "Cursor does not match this search; restart without cursor.") from error
+            with self._snapshot_lock:
+                snapshot = self._search_snapshots.get(data["snapshot"])
+                if snapshot is None or time.monotonic() - snapshot["created"] > 300:
+                    self._search_snapshots.pop(data["snapshot"], None)
+                    raise ToolError("cursor_expired", "Search snapshot expired or was evicted; restart without cursor.")
+                if snapshot["fingerprint"] != fingerprint:
+                    raise ToolError("invalid_cursor", "Cursor does not match this search.")
+                self._search_snapshots.move_to_end(data["snapshot"])
+            return self._search_page(data["snapshot"], snapshot, data["offset"], max_results)
 
         target = self.resolve(path)
         def candidate_files():
@@ -207,13 +342,13 @@ class ProjectTools:
         needle = query if case_sensitive else query.casefold()
         per_file = {}
         stored_matches = 0
+        stored_characters = 0
         total_matches = 0
         files_scanned = 0
         files_skipped = 0
         collection_truncated = False
         max_files = 5000
         max_stored_matches = 10000
-        max_output_characters = 20000
         noise_names = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml"}
         noise_suffixes = (".min.js", ".min.css", ".map")
 
@@ -224,7 +359,7 @@ class ProjectTools:
                 if not safe.is_file():
                     continue
                 relative_text = relative.as_posix()
-                if file_pattern and not fnmatch.fnmatch(relative_text, file_pattern):
+                if file_pattern and not self.matches_glob(relative_text, file_pattern):
                     continue
                 lower_name = safe.name.lower()
                 if lower_name in noise_names or lower_name.endswith(noise_suffixes):
@@ -248,8 +383,15 @@ class ProjectTools:
             lines = text.splitlines()
             file_record = None
             for line_number, line in enumerate(lines, 1):
-                haystack = line if case_sensitive else line.casefold()
-                if needle not in haystack:
+                try:
+                    if regex:
+                        matched = compiled_pattern.search(line, timeout=0.05) is not None
+                    else:
+                        haystack = line if case_sensitive else line.casefold()
+                        matched = needle in haystack
+                except TimeoutError as error:
+                    raise ToolError("invalid_arguments", "Regular expression search timed out; simplify the pattern.") from error
+                if not matched:
                     continue
                 total_matches += 1
                 if file_record is None:
@@ -275,6 +417,10 @@ class ProjectTools:
                             snippet = snippet[:299] + "…"
                         rendered_lines.append(f"{marker} {number}: {snippet}")
                     block = "\n".join(rendered_lines)
+                if stored_characters + len(block) > 500000:
+                    collection_truncated = True
+                    continue
+                stored_characters += len(block)
                 file_record["blocks"].append(block)
                 stored_matches += 1
 
@@ -293,47 +439,38 @@ class ProjectTools:
                 break
             round_number += 1
 
-        page = []
-        output_characters = 0
-        index = offset
-        while index < len(ordered_blocks) and len(page) < max_results:
-            block = ordered_blocks[index]
-            projected = output_characters + len(block) + (2 if page else 0)
-            if projected > max_output_characters:
-                break
-            page.append(block)
-            output_characters = projected
-            index += 1
-
-        has_more = index < len(ordered_blocks)
-        next_cursor = None
-        if has_more:
-            raw_cursor = json.dumps({"fingerprint": fingerprint, "offset": index},
-                                    separators=(",", ":")).encode("utf-8")
-            next_cursor = base64.urlsafe_b64encode(raw_cursor).decode("ascii").rstrip("=")
-        file_counts = [{"path": name, "matches": per_file[name]["count"]}
-                       for name in ranked_files[:100]]
-        return {"query": query, "path": path, "file_pattern": file_pattern,
-                "context_lines": context_lines,
-                "matches": "\n\n".join(page),
-                "matches_returned": len(page), "total_matches": total_matches,
-                "files_with_matches": len(per_file), "file_counts": file_counts,
-                "files_scanned": files_scanned,
-                "files_skipped": files_skipped,
-                "truncated": has_more or collection_truncated,
-                "collection_truncated": collection_truncated,
-                "next_cursor": next_cursor}
+        snapshot = {"created": time.monotonic(), "fingerprint": fingerprint,
+                    "blocks": ordered_blocks, "metadata": {
+                        "mode": "regex" if regex else "literal", "query": query,
+                        "path": path, "file_pattern": file_pattern,
+                        "context_lines": context_lines, "total_matches": total_matches,
+                        "files_with_matches": len(per_file), "files_scanned": files_scanned,
+                        "files_skipped": files_skipped, "collection_truncated": collection_truncated}}
+        snapshot_id = uuid.uuid4().hex
+        with self._snapshot_lock:
+            self._search_snapshots[snapshot_id] = snapshot
+            while len(self._search_snapshots) > 8:
+                self._search_snapshots.popitem(last=False)
+        return self._search_page(snapshot_id, snapshot, 0, max_results)
 
     def execute(self, name, arguments):
         handlers = {"read_file": self.read_file, "list_files": self.list_files,
-                    "search_text": self.search_text}
+                    "search_text": self.search_text,
+                    "search_regex": self.search_regex}
         if name not in handlers:
-            raise ValueError("Unknown or unavailable tool.")
-        return handlers[name](**arguments)
+            raise ToolError("invalid_arguments", "Unknown or unavailable tool.")
+        validate_arguments(next(t for t in FILE_TOOLS if t['function']['name'] == name), arguments)
+        try:
+            return handlers[name](**arguments)
+        except OSError as error:
+            raise ToolError('path_inaccessible', 'Path cannot be read. Check that it exists and is accessible.') from error
 
 
 def parse_arguments(raw):
-    arguments = json.loads(raw)
+    try:
+        arguments = json.loads(raw)
+    except (TypeError, ValueError) as error:
+        raise ToolError('invalid_arguments', 'Tool arguments must be valid JSON containing one object.') from error
     if not isinstance(arguments, dict):
-        raise ValueError("Tool arguments must be a JSON object.")
+        raise ToolError("invalid_arguments", "Tool arguments must be a JSON object.")
     return arguments
