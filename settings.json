@@ -1,22 +1,115 @@
 {
   "api": {
-    "timeout_seconds": 60.0,
+    "timeout_seconds": 60,
+    "request_timeout_seconds": 180,
     "max_retries": 0
   },
   "generation": {
-    "max_completion_tokens": 4096,
-    "temperature": 1.0,
+    "research_max_completion_tokens": 8192,
+    "report_max_completion_tokens": 4096,
+    "temperature": 1,
     "top_p": 0.95
   },
   "execution": {
     "max_api_calls_per_turn": 16,
     "max_steps_per_agent": 8,
-    "reserved_director_calls": 2,
-    "final_answer_target_tokens": 2800,
-    "max_delegated_task_characters": 20000
+    "reserved_director_calls": 3,
+    "force_final_at_calls_remaining": 1,
+    "final_answer_target_tokens": 1800,
+    "turn_timeout_seconds": 600,
+    "finalization_reserve_seconds": 90,
+    "verification_report_reserve_seconds": 15,
+    "max_delegated_task_characters": 20000,
+    "implementation_reserve_calls": 4,
+    "implementation_max_research_calls": 6,
+    "implementation_research_seconds": 180,
+    "implementation_max_read_calls": 2,
+    "workflow": "focused",
+    "development_strategy": "direct",
+    "max_comparison_rounds": 3,
+    "implementation_read_max_lines": 120,
+    "edit_retry_limit": 2,
+    "verification_reserve_calls": 2,
+    "max_implementation_recoveries": 1,
+    "draft_context_characters": 6000
+  },
+  "checks": {
+    "python_compile": [
+      "C:\\Users\\621\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+      "-m",
+      "compileall",
+      "-q",
+      "."
+    ]
   },
   "roles": {
-    "director": { "max_delegations": 2 },
-    "worker": { "max_delegations": 0 }
+    "director": {
+      "max_delegations": 2,
+      "allow_editing": true
+    },
+    "worker": {
+      "max_delegations": 0,
+      "allow_editing": false
+    }
+  },
+  "git": {
+    "commit_mode": "manual",
+    "allow_branch_creation": false
+  },
+  "tool_limits": {
+    "check_timeout_seconds": 120,
+    "git_timeout_seconds": 20,
+    "max_parallel_local_tools": 4
+  },
+  "profiles": {
+    "comparison": {
+      "roles": {
+        "director": {"allow_editing": false},
+        "worker": {"allow_editing": true}
+      },
+      "git": {"commit_mode": "autonomous", "allow_branch_creation": false},
+      "execution": {
+        "workflow": "project",
+        "development_strategy": "comparison",
+        "max_api_calls_per_turn": 60,
+        "max_steps_per_agent": 12,
+        "turn_timeout_seconds": 1800,
+        "finalization_reserve_seconds": 120,
+        "verification_report_reserve_seconds": 30,
+        "implementation_reserve_calls": 6,
+        "verification_reserve_calls": 3
+      },
+      "checks": {
+        "python_tests": ["{python}", "-B", "-c",
+          "import sys, unittest; suite = unittest.defaultTestLoader.discover('tests'); count = suite.countTestCases(); print(f'Discovered {count} tests'); sys.exit(0 if count and unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)"]
+      }
+    },
+    "project": {
+      "roles": {
+        "worker": {"allow_editing": true}
+      },
+      "git": {
+        "commit_mode": "autonomous",
+        "allow_branch_creation": true
+      },
+      "execution": {
+        "workflow": "project",
+        "max_api_calls_per_turn": 60,
+        "max_steps_per_agent": 12,
+        "turn_timeout_seconds": 1800,
+        "finalization_reserve_seconds": 120,
+        "verification_report_reserve_seconds": 30,
+        "implementation_reserve_calls": 6,
+        "verification_reserve_calls": 3
+      },
+      "checks": {
+        "python_tests": [
+          "{python}",
+          "-B",
+          "-c",
+          "import sys, unittest; suite = unittest.defaultTestLoader.discover('tests'); count = suite.countTestCases(); print(f'Discovered {count} tests'); sys.exit(0 if count and unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)"
+        ]
+      }
+    }
   }
 }
