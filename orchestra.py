@@ -690,7 +690,8 @@ class TaskScheduler:
             result.update(round_id=record['round_id'], alternative=record['alternative'])
         return result
 
-    async def wait(self, task_ids=None, return_when="all", timeout_seconds=60):
+    async def wait(self, task_ids=None, return_when="all", timeout_seconds=60,
+                   *, until_event=False, deadline=None):
         if task_ids is not None and (not isinstance(task_ids, list)
                                      or not all(isinstance(item, str) for item in task_ids)):
             raise ValueError("task_ids must be an array of task ID strings.")
@@ -699,7 +700,10 @@ class TaskScheduler:
         if (type(timeout_seconds) not in (int, float)
                 or not 1 <= timeout_seconds <= 120):
             raise ValueError("timeout_seconds must be from 1 to 120.")
-        selected_ids = list(dict.fromkeys(task_ids or self.tasks.keys()))
+        default_ids = [key for key, record in self.tasks.items()
+                       if not until_event or record['status'] == 'running'
+                       or not record['collected']]
+        selected_ids = list(dict.fromkeys(task_ids or default_ids or self.tasks.keys()))
         if not selected_ids:
             raise ValueError("No delegated tasks are available to wait for.")
         if any(task_id not in self.tasks for task_id in selected_ids):
@@ -710,8 +714,14 @@ class TaskScheduler:
         already_finished = any(self.tasks[task_id]["status"] != "running"
                                for task_id in selected_ids)
         if pending and not (return_when == "any" and already_finished):
+            # Model waits are event-driven. A local polling interval must not
+            # wake the director and resend its context without a useful event.
+            timeout = timeout_seconds
+            if until_event:
+                timeout = (None if deadline is None else
+                           max(0, deadline - time.monotonic()))
             done, still_pending = await asyncio.wait(
-                pending, timeout=timeout_seconds,
+                pending, timeout=timeout,
                 return_when=(asyncio.FIRST_COMPLETED if return_when == "any"
                              else asyncio.ALL_COMPLETED))
             timed_out = (bool(still_pending) if return_when == "all"
@@ -1458,6 +1468,21 @@ class Orchestra:
                 research_seconds_remaining=seconds_remaining(research_deadline),
                 turn_seconds_remaining=seconds_remaining(turn_deadline),
             )
+            if force_final:
+                finalization_reason = (
+                    'finalization_deadline' if deadline_final else
+                    'call_budget' if role == 'director' and budget['calls'] <= final_threshold else
+                    'agent_step_limit' if step == call_limit - 1 else
+                    'implementation_blocker' if implementation_blocker is not None else
+                    'recovery_exhausted' if recovery_exhausted else
+                    'model_recovery' if recovery_final else 'report_requested')
+                resource_status += (
+                    f' Runtime finalization reason={finalization_reason}; '
+                    'this is the reason tools are closed, not evidence the task is complete. '
+                    'Report this reason accurately; do not claim a time deadline unless one was reached.')
+                trace.event('finalization_requested', task_id=task_id,
+                            reason=finalization_reason, calls_remaining=budget['calls'],
+                            turn_seconds_remaining=seconds_remaining(turn_deadline))
             budget["calls"] -= 1
             request_limit = (self.settings["generation"]["report_max_completion_tokens"]
                              if force_final else
@@ -1746,7 +1771,7 @@ class Orchestra:
                                 "wait_must_follow_delegation",
                                 "Call wait_tasks in the next model response, after delegate_task submissions have returned their task IDs.")
                         wait_deadline = finalization_deadline
-                        if phase.enabled and not phase.active:
+                        if phase.enabled and not phase.active and phase.workflow == 'focused':
                             wait_deadline = min(phase.deadline, wait_deadline or float('inf'))
                         if wait_deadline is not None:
                             remaining = wait_deadline - time.monotonic()
@@ -1755,11 +1780,15 @@ class Orchestra:
                                           "all_finished": True,
                                           "timed_out": True}
                             else:
-                                args["timeout_seconds"] = min(
-                                    args.get("timeout_seconds", 60), max(1, remaining))
-                                result = await scheduler.wait(**args)
+                                result = await scheduler.wait(**args, until_event=True,
+                                                              deadline=wait_deadline)
                         else:
-                            result = await scheduler.wait(**args)
+                            result = await scheduler.wait(**args, until_event=True)
+                        if result.get('timed_out'):
+                            result['wait_stop_reason'] = (
+                                'finalization_deadline' if finalization_deadline is not None
+                                and time.monotonic() >= finalization_deadline
+                                else 'research_phase_deadline')
                     elif name in {'review_task_changes', 'apply_task_changes'} and role == 'director':
                         if scheduler is None or scheduler.workspaces is None:
                             raise PublicToolError('worker_changes_unavailable', 'No implementation worker changes are available in this turn.')

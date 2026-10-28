@@ -87,13 +87,13 @@ COMPARISON_TOOLS = [
 ]
 WAIT_TASKS_TOOL = definition(
     "wait_tasks",
-    "Wait for worker results. Omit task_ids to select all workers in this turn. Returns execution and result status, including available drafts. A timeout does not cancel workers.",
+    "Wait for worker results until the selected completion event or the runtime research/finalization deadline. The application waits locally without repeated model calls. Omit task_ids to select running or uncollected workers. Returns execution and result status, including available drafts. Waiting itself does not cancel workers.",
     {"task_ids": {"type": "array", "items": {"type": "string"},
                   "description": "Optional delegated task IDs to wait for."},
      "return_when": {"type": "string", "enum": ["any", "all"],
                      "description": "Return after any selected task finishes or after all finish; default all."},
      "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 120,
-                         "description": "Local wait timeout; default 60 seconds. This does not cancel workers."}},
+                         "description": "Legacy compatibility field (1-120). Does not wake the model on this interval; the runtime deadline bounds waiting."}},
     [])
 
 
