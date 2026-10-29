@@ -222,7 +222,7 @@ If a commit succeeds but follow-up inspection fails, the tool returns
 From the project directory, run:
 
 ```text
-python -B -m unittest -v
+python -B -m unittest discover -v
 ```
 
 The suite uses temporary workspaces, real tool dispatch, real Git operations,
@@ -232,3 +232,36 @@ replacement, multi-file patch refusal without partial writes, invalid
 arguments and paths, duplicate/concurrent creation, check failure/truncation/
 timeout, worker restrictions and blocker finalization. The symbolic-link test
 skips when the OS does not permit the test user to create a link.
+
+
+## Comparison acceptance
+
+`start_comparison_round` takes short `acceptance_checks` strings and returns
+stable, round-local IDs C1, C2, etc. The same catalog is included in the worker
+assignment. Do not repeat criterion text during promotion.
+
+Each `promote_candidate.acceptance` entry contains `id`, `evidence`, and exactly
+one of these evidence sources:
+
+- `check`: a configured check name, with actual test names/results in evidence.
+- `files`: candidate-relative paths, with concrete review findings in evidence.
+  Use this for README/coverage documentation; no dummy automated check is needed.
+
+Example: `{"id":"C1","check":"python_tests","evidence":"test_create passed"}`.
+Example: `{"id":"C2","files":["README.md"],"evidence":"Launch and error codes documented"}`.
+
+Unknown/duplicate/missing IDs and unknown checks refuse promotion before
+transfer. Errors return the criterion catalog, available checks and examples.
+Review files must exist and pass the workspace path policy. This validates
+evidence structure, not its semantic truth: the director still reviews test
+coverage. All configured checks still rerun during promotion, even for file
+review evidence. Empty alternatives need no diff review; nonempty ones do.
+
+`decision: checkpoint` with empty acceptance and gaps in rationale closes the
+round and returns the saved artifact/fingerprint without changing or committing
+the accepted branch. Later rounds still start at the accepted commit; checkpoints
+are not automatically resumed. Execution and acceptance statuses are separate.
+
+If a specification defines stages, delegate one stage at a time. Explicit
+skeleton stubs can satisfy the skeleton stage but cannot satisfy future behavior
+requirements. A run may stop between stages; never merge them to fit a call limit.
