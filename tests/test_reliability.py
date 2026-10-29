@@ -106,7 +106,8 @@ class RuntimeReliability(unittest.IsolatedAsyncioTestCase):
 
     async def test_implementation_reserve_is_enforced(self):
         app = self.app()
-        scheduler = SimpleNamespace(completion_blockers=lambda: [], submit=MagicMock())
+        scheduler = SimpleNamespace(completion_blockers=lambda: [], submit=MagicMock(),
+                                    reference_state=lambda: {'active_round_id': None, 'tasks': []})
         app.request = AsyncMock(side_effect=[
             {'role': 'assistant', 'content': None, 'tool_calls': [self.call('delegate_task', {'task': 'Inspect', 'max_calls': 4, 'report_target_tokens': 100})]},
             {'role': 'assistant', 'content': None, 'tool_calls': [self.call('report_blocker', {'reason': 'missing_information', 'evidence': 'Relevant source was not provided.', 'next_step': 'Supply the target source.'})]},

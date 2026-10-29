@@ -15,7 +15,7 @@ from orchestra import TurnTrace
 from tool_contracts import validate_arguments
 from tool_errors import ToolError
 from tools import FILE_TOOLS, ProjectTools, parse_arguments
-import test_reliability
+from tests import test_reliability
 
 
 class BaseToolTests(unittest.TestCase):

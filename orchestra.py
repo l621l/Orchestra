@@ -7,13 +7,15 @@ import re
 import time
 import uuid
 import copy
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
 from openai import AsyncOpenAI, APIConnectionError
 from tool_errors import ToolError as PublicToolError, model_result
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
+from rich.text import Text
 from rich.live import Live
 from rich.table import Table
 from git_tools import GIT_TOOLS, GIT_TOOL_NAMES, WORKSPACE_TOOL_NAMES, RepositoryTools
@@ -25,6 +27,9 @@ from worker_workspaces import WorkerWorkspaces
 from workspace_policy import WorkspacePolicy
 from runtime_settings import load_runtime_settings
 from execution_phase import ImplementationPhase, BLOCKER_TOOL, validate_blocker
+from context_compaction import compact_round_reviews
+from no_progress import EditProgress, validate_role_policies
+from acceptance import validate_criteria, validate_acceptance, criterion_catalog
 
 BASE = Path(__file__).resolve().parent
 
@@ -43,20 +48,114 @@ def request_requires_mutation(text):
 
 
 class AgentDashboard:
-    def __init__(self):
+    def __init__(self, recent_actions=8):
         self.console = Console()
         self.live = None
         self.states = {}
         self.title = "Orchestra"
+        self.recent_actions = recent_actions
+        self.actions = deque(maxlen=max(1, recent_actions))
+        self.rounds = {}
+        self.agent_rounds = {}
+        self.task_agents = {}
+        self.usage = {}
+        self.started = time.monotonic()
+
+    def set_usage(self, label, entry, pending=False):
+        self.usage[label] = {key: entry.get(key, 0) for key in
+                             ('api_calls', 'reported_calls', 'total_tokens')}
+        self.usage[label]['pending'] = pending
+
+    @staticmethod
+    def token_count(count):
+        if count >= 1_000_000:
+            return f'{count / 1_000_000:.2f}M'
+        if count >= 1000:
+            return f'{count / 1000:.1f}k'
+        return str(count)
+
+    def usage_cells(self, entry):
+        pending = entry.get('pending', False)
+        missing = entry.get('api_calls', 0) - entry.get('reported_calls', 0) - int(pending) > 0
+        marker = ('*' if pending else '') + ('?' if missing else '')
+        tokens = ('unknown' if missing and not entry.get('reported_calls', 0)
+                  else self.token_count(entry.get('total_tokens', 0)) + marker)
+        return (str(entry.get('api_calls', 0)),
+                tokens)
+
+    @staticmethod
+    def short(value, limit=90):
+        # Terminal output must not interpret file names as ANSI/control codes.
+        text = ' '.join(''.join(c if c.isprintable() else ' ' for c in str(value)).split())
+        return text if len(text) <= limit else text[:limit - 3] + '...'
+
+    def register_round(self, round_id, workers):
+        number = self.rounds.setdefault(round_id, len(self.rounds) + 1)
+        for index, worker in enumerate(workers):
+            label = worker['agent']
+            self.agent_rounds[label] = f'R{number}/{worker.get("alternative", chr(65 + index))}'
+            self.task_agents[worker['task_id']] = label
+
+    def describe_tool(self, name, args):
+        detail = self.short(args.get('path', ''))
+        if name == 'read_file' and ('start_line' in args or 'end_line' in args):
+            detail += f":{args.get('start_line', 1)}-{args.get('end_line', 'end')}"
+        elif name in {'search_text', 'search_regex'}:
+            detail = f"{detail or '.'} | {self.short(args.get('query', args.get('pattern', '')), 45)}"
+        elif name == 'run_check':
+            detail = args.get('name', '')
+        elif name in {'review_task_changes', 'apply_task_changes', 'promote_candidate'}:
+            key = self.short(args.get('task_id', ''))
+            detail = self.task_agents.get(key, key)
+            if args.get('path'):
+                detail += ' | ' + self.short(args['path'])
+        elif name in {'start_comparison_round', 'delegate_task'}:
+            detail = f"budget={args.get('max_calls_per_worker', args.get('max_calls', '?'))} calls"
+        elif name == 'wait_tasks':
+            detail = args.get('return_when', 'all')
+        elif name == 'git_create_branch':
+            detail = args.get('name', args.get('branch', ''))
+        elif name in {'create_commit', 'reject_comparison_round'}:
+            detail = args.get('message', args.get('round_id', ''))
+        return self.short(f'{name} {detail}'.strip())
+
+    def tool_finished(self, label, name, args, output, duration=0):
+        result = output.get('result') or {}
+        status = 'OK' if output.get('ok') else 'ERROR'
+        if output.get('ok') and (result.get('passed') is False or result.get('promoted') is False):
+            status = 'FAILED'
+        detail = self.describe_tool(name, args)
+        if not output.get('ok'):
+            detail += ' | ' + self.short(output.get('error', 'error'), 35)
+        elif name == 'start_comparison_round':
+            detail += f" | R{self.rounds.get(result.get('round_id'), '?')} started"
+        elif name == 'promote_candidate' and result.get('promoted'):
+            detail += f" | accepted -> {str(result.get('commit') or '')[:8]}"
+        elif name == 'run_check':
+            detail += ' | passed' if result.get('passed') else ' | failed'
+        elif name in EDIT_TOOL_NAMES and result.get('files_changed') is not None:
+            detail += f" | files={result['files_changed']}"
+        elif name == 'wait_tasks':
+            detail += ' | deadline' if result.get('timed_out') else ' | results received'
+        if self.recent_actions:
+            self.actions.append((time.monotonic() - self.started,
+                self.agent_rounds.get(label, '') + ' ' + label,
+                status, self.short(detail, 140), duration))
+        if label in self.states:
+            self.states[label]['activity'] = detail
+        if self.live:
+            self.live.update(self.render(), refresh=True)
 
     def render(self):
-        table = Table(title=self.title, box=box.ROUNDED, expand=True,
+        table = Table(title=Text(self.title), box=box.ROUNDED, expand=True,
                       header_style="bold cyan", border_style="bright_black")
         table.add_column("Agent", style="bold", no_wrap=True)
         table.add_column("Status", no_wrap=True)
-        table.add_column("Activity")
+        table.add_column("Activity", no_wrap=True, overflow='ellipsis')
         table.add_column("Time", justify="right", no_wrap=True)
         table.add_column("Stream", justify="right", no_wrap=True)
+        table.add_column("Calls", justify="right", no_wrap=True)
+        table.add_column("Tokens", justify="right", no_wrap=True)
         table.add_column("Spent", justify="right", no_wrap=True,
                          style="bright_green")
         total_cost = 0.0
@@ -77,16 +176,53 @@ class AgentDashboard:
                 cost_text = f"${cost:.5f}"
                 total_cost += cost
                 known_costs = True
-            table.add_row(prefix + label, f"[{status_style}]{status}[/{status_style}]",
-                          state["activity"], f"{elapsed:.1f}s", chunks, cost_text)
+            agent = prefix + self.agent_rounds.get(label, '') + ' ' + label
+            calls_text, tokens_text = self.usage_cells(self.usage.get(label, {}))
+            table.add_row(Text(agent.strip()), f"[{status_style}]{status}[/{status_style}]",
+                          Text(self.short(state["activity"])), f"{elapsed:.1f}s", chunks,
+                          calls_text, tokens_text, cost_text)
         if self.states:
             table.add_section()
-            table.add_row("TOTAL", "", "completed API calls", "", "",
+            totals = {key: sum(entry.get(key, 0) for entry in self.usage.values())
+                      for key in ('api_calls', 'reported_calls', 'total_tokens')}
+            totals['pending'] = any(entry['pending'] for entry in self.usage.values())
+            # Multiple requests can be pending, so compute missing reports
+            # separately rather than treating them as one missing usage record.
+            pending_count = sum(int(entry['pending']) for entry in self.usage.values())
+            total_marker = ('*' if pending_count else '') + ('?' if
+                totals['api_calls'] - totals['reported_calls'] - pending_count > 0 else '')
+            total_tokens = ('unknown' if '?' in total_marker and not totals['reported_calls']
+                            else self.token_count(totals['total_tokens']) + total_marker)
+            table.add_row("TOTAL", "", "started calls / reported tokens", "", "",
+                          str(totals['api_calls']), total_tokens,
                           f"${total_cost:.5f}" if known_costs else "—")
-        return table
+        if self.usage:
+            table.caption = Text('Tokens: provider-reported totals; * usage pending; ? usage missing')
+        available = max(0, self.console.size.height - len(self.states) - 10)
+        visible = min(self.recent_actions, available)
+        if not self.actions or not visible:
+            return table
+        actions = Table(title='Recent actions (worker edits stay private until accepted)',
+                        box=None, expand=True, padding=(0, 1))
+        actions.add_column('At', width=6, no_wrap=True)
+        actions.add_column('Agent', width=17, no_wrap=True, overflow='ellipsis')
+        actions.add_column('Result', width=6, no_wrap=True)
+        actions.add_column('Action', overflow='ellipsis', no_wrap=True)
+        actions.add_column('Took', width=6, justify='right', no_wrap=True)
+        for elapsed, agent, status, detail, duration in list(self.actions)[-visible:]:
+            style = {'OK': 'green', 'ERROR': 'red', 'FAILED': 'red'}[status]
+            actions.add_row(f'{int(elapsed) // 60:02}:{int(elapsed) % 60:02}',
+                            Text(agent.strip()), Text(status, style=style), Text(detail), f'{duration:.1f}s')
+        return Group(table, actions)
 
     def start(self, turn_id, topic):
         self.states = {}
+        self.actions.clear()
+        self.rounds.clear()
+        self.agent_rounds.clear()
+        self.task_agents.clear()
+        self.usage.clear()
+        self.started = time.monotonic()
         self.title = f"Orchestra · {topic}"
         self.live = Live(self.render(), console=self.console, refresh_per_second=4,
                          transient=False)
@@ -222,7 +358,8 @@ class TurnTrace:
             "started_at": utc_now(),
             "duration_seconds": None,
             "usage": {"api_calls": 0, "prompt_tokens": 0,
-                      "completion_tokens": 0, "total_tokens": 0},
+                      "completion_tokens": 0, "total_tokens": 0,
+                      "reported_calls": 0, "cached_tokens": 0, "reasoning_tokens": 0},
             "metrics": {"tool_calls": 0, "tool_failures": 0,
                         "read_file_calls": 0, "lines_read": 0,
                         "characters_read": 0, "list_files_calls": 0,
@@ -234,7 +371,9 @@ class TurnTrace:
                         "checks_run": 0, "checks_failed": 0, "blockers_reported": 0,
                         "files_changed": 0,
                         "task_wait_calls": 0,
-                        "delegations": 0},
+                        "delegations": 0, 'first_edit_seconds': None,
+                        'calls_to_first_edit': None, 'timeouts': 0, 'length_stops': 0,
+                        'completed_checks': []},
             "children": [],
             "depth": depth,
             "_started": time.monotonic(),
@@ -265,10 +404,15 @@ class TurnTrace:
         task_usage = self.tasks[task_id]["usage"]
         task_usage["api_calls"] += 1
         if usage:
+            task_usage['reported_calls'] += 1
             for source, target in (("prompt_tokens", "prompt_tokens"),
                                    ("completion_tokens", "completion_tokens"),
                                    ("total_tokens", "total_tokens")):
                 task_usage[target] += usage.get(source, 0) or 0
+            task_usage['cached_tokens'] += (usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0) or 0
+            task_usage['reasoning_tokens'] += (usage.get('completion_tokens_details') or {}).get('reasoning_tokens', 0) or 0
+        self.tasks[task_id]['metrics']['timeouts'] += int(error_type in {'TimeoutError', 'APITimeoutError'})
+        self.tasks[task_id]['metrics']['length_stops'] += int(finish_reason == 'length')
         self.event("model_request_finished", task_id=task_id,
                    request_id=request_id,
                    provider_response_id=provider_response_id,
@@ -301,6 +445,9 @@ class TurnTrace:
         elif name in {"git_status", "git_diff", "git_log", "git_show", "git_create_branch", "prepare_commit", "create_commit"}:
             metrics["git_calls"] += 1
         elif name in EDIT_TOOL_NAMES or name == 'apply_task_changes' or (name == 'promote_candidate' and result_summary.get('workspace_changed')):
+            if metrics['first_edit_seconds'] is None:
+                metrics['first_edit_seconds'] = round(time.monotonic() - self.tasks[task_id]['_started'], 1)
+                metrics['calls_to_first_edit'] = self.tasks[task_id]['usage']['api_calls']
             metrics["edits_applied"] += 1
             metrics["patches_applied"] += int(name == 'apply_patch')
             metrics["files_created"] += int(name == 'create_file')
@@ -311,6 +458,9 @@ class TurnTrace:
         elif name == 'run_check':
             metrics['checks_run'] += 1
             metrics['checks_failed'] += int(not result_summary.get('passed', False))
+            metrics['completed_checks'].append({'name': arguments.get('name'),
+                'passed': result_summary.get('passed', False), 'error_type': error_type,
+                'duration_seconds': round(duration, 1)})
         elif name == 'report_blocker':
             metrics['blockers_reported'] += 1
         elif name == "wait_tasks":
@@ -336,10 +486,24 @@ class TurnTrace:
         task = {key: value for key, value in source.items()
                 if key not in {"children", "depth", "_started"}}
         task["children"] = [self.task_tree(child) for child in source["children"]]
+        task['usage'] = self.usage_snapshot(source['usage'])
         return task
 
+    @staticmethod
+    def usage_snapshot(usage):
+        result = dict(usage)
+        result['missing_usage_calls'] = usage['api_calls'] - usage.get('reported_calls', 0)
+        result['usage_complete'] = result['missing_usage_calls'] == 0
+        result['usage_status'] = ('complete' if result['usage_complete'] else
+                                  'partial' if usage.get('reported_calls', 0) else 'unknown')
+        if result['usage_status'] == 'unknown':
+            for key in ('prompt_tokens', 'completion_tokens', 'total_tokens', 'cached_tokens', 'reasoning_tokens'):
+                result[key] = None
+        return result
+
     def flush_summary(self):
-        totals = {"api_calls": 0, "prompt_tokens": 0,
+        totals = {"api_calls": 0, "prompt_tokens": 0, 'reported_calls': 0,
+                  'cached_tokens': 0, 'reasoning_tokens': 0,
                   "completion_tokens": 0, "total_tokens": 0}
         for task in self.tasks.values():
             for name in totals:
@@ -352,7 +516,9 @@ class TurnTrace:
             "topic": self.topic,
             "request": self.user_input,
             "workspace": self.workspace,
-            "usage": totals,
+            "usage": self.usage_snapshot(totals),
+            'status_semantics': 'execution_only',
+            'specification_status': 'not_assessed_by_runtime',
             "modified_files": sorted(self.modified_files),
             "verification": self.verification,
             "answer_file": "answer.md" if (self.directory / "answer.md").exists() else None,
@@ -400,6 +566,7 @@ class TaskScheduler:
         worker_task_id = self.trace.start_task(label, description, parent_task_id)
         self.trace.tasks[worker_task_id]['mode'] = mode
         record = {"task_id": worker_task_id, "agent": label,
+                  'assignment': description,
                   "mode": mode, "changes": None,
                   'prepared_repository': prepared_repository,
                   "status": "running", "allocated_calls": max_calls,
@@ -428,7 +595,7 @@ class TaskScheduler:
                 self.trace.directory.parent / '_workspaces' / self.trace.turn_id.removeprefix('turn_'))
         return self.workspaces
 
-    async def start_comparison(self, task, max_calls_per_worker, report_target_tokens, parent_task_id):
+    async def start_comparison(self, task, max_calls_per_worker, report_target_tokens, parent_task_id, acceptance_checks=None, stage_id=None):
         settings = self.app.settings['execution']
         if self.active_round_id is not None:
             raise PublicToolError('comparison_round_active', 'Finish or reject the active round before starting another.')
@@ -436,6 +603,14 @@ class TaskScheduler:
             raise PublicToolError('workers_running', 'Wait for current workers before starting the paired round.')
         if len(self.rounds) >= settings.get('max_comparison_rounds', 3):
             raise PublicToolError('comparison_round_limit', 'No comparison rounds remain in this turn.')
+        if self.rounds:
+            previous = list(self.rounds.values())[-1]
+            stalled = [self.tasks[key] for key in previous['task_ids']
+                       if self.tasks[key].get('stop_reason') == 'no_progress']
+            if stalled and previous['task'].strip() == task.strip():
+                raise PublicToolError('task_scope_not_reduced',
+                    'A worker stopped with no_progress. Use smaller implementation steps and explicit deferred '
+                    'work; preserve the complete contract of a named stage. Do not resubmit the identical assignment.')
         maximum = settings['max_steps_per_agent']
         if not 2 <= max_calls_per_worker <= maximum:
             raise PublicToolError('worker_call_limit_exceeded', f'Choose 2 to {maximum} calls per worker.')
@@ -445,10 +620,44 @@ class TaskScheduler:
             raise PublicToolError('invalid_arguments', 'Comparison task exceeds the configured size limit.')
         reserve = max(settings['reserved_director_calls'], settings['implementation_reserve_calls'])
         if 2 * max_calls_per_worker > self.shared_budget['calls'] - reserve:
-            raise PublicToolError('batch_worker_budget_exceeded', 'The pair exceeds the shared budget after reserving director calls.')
+            raise PublicToolError('batch_worker_budget_exceeded',
+                'The pair exceeds the shared budget. Reduce the capability, retaining tests and repair time.',
+                shared_calls=self.shared_budget['calls'], director_reserve=reserve,
+                max_calls_per_worker=min(maximum, max(0, (self.shared_budget['calls'] - reserve) // 2)))
+        acceptance_checks = validate_criteria(acceptance_checks)
+        if stage_id is not None and (not isinstance(stage_id, str) or not stage_id.strip()):
+            raise PublicToolError('invalid_arguments', 'stage_id must be a nonempty string.')
+        inferred_stage = re.search(r'\bS\d{2}(?:\.[a-zA-Z0-9]+)?\b', task, re.IGNORECASE)
+        stage_id = stage_id.strip().upper() if stage_id else (inferred_stage.group().upper() if inferred_stage else None)
+        if self.rounds:
+            previous = list(self.rounds.values())[-1]
+            if previous.get('stage_id') and previous['status'] != 'promoted':
+                if stage_id is not None and stage_id != previous['stage_id']:
+                    raise PublicToolError('comparison_stage_incomplete',
+                        'Finish the pending stage before starting another stage.', stage_id=previous['stage_id'])
+                stage_id = previous['stage_id']
+                if acceptance_checks != previous['acceptance_checks']:
+                    raise PublicToolError('comparison_contract_changed',
+                        'Retry the stage with its original acceptance criteria, including documentation. '
+                        'Correct the implementation; do not remove, rewrite or reorder criteria.',
+                        stage_id=stage_id, acceptance_checks=previous['acceptance_checks'])
+        worker_deadline = self.turn_deadline
+        review_reserve = settings.get('comparison_review_reserve_seconds', 0)
+        if self.finalization_deadline is not None and review_reserve:
+            worker_deadline = min(worker_deadline or float('inf'), self.finalization_deadline - review_reserve)
+            minimum_time = self.app.settings['api']['request_timeout_seconds']
+            if worker_deadline - time.monotonic() <= minimum_time:
+                raise PublicToolError('comparison_time_reserve',
+                    'Not enough time for another worker request plus review and promotion. Preserve the backlog.',
+                    review_reserve_seconds=review_reserve)
+        worker_assignment = task + '\n\nAcceptance contract (all criteria required for promotion):\n' + '\n'.join(
+            item['id'] + ': ' + item['description'] for item in criterion_catalog(acceptance_checks))
+        if len(worker_assignment) > settings['max_delegated_task_characters']:
+            raise PublicToolError('invalid_arguments', 'Task and acceptance criteria exceed the configured size limit.')
         manager = self._workspace_manager()
         round_id = self.trace.new_id('round')
-        round_record = {'round_id': round_id, 'status': 'preparing', 'task': task, 'task_ids': []}
+        round_record = {'round_id': round_id, 'status': 'preparing', 'task': task, 'task_ids': [],
+                        'acceptance_checks': acceptance_checks, 'stage_id': stage_id}
         self.rounds[round_id] = round_record
 
         def prepare():
@@ -476,16 +685,19 @@ class TaskScheduler:
             for side, repo in zip(('A', 'B'), repositories):
                 number = self.shared_budget.setdefault('next_worker_id', 1)
                 self.shared_budget['next_worker_id'] = number + 1
-                submitted = self.submit(f'worker-{number}', task, parent_task_id, max_calls_per_worker,
+                submitted = self.submit(f'worker-{number}', worker_assignment, parent_task_id, max_calls_per_worker,
                                         report_target_tokens, mode='implementation', prepared_repository=repo)
                 task_id = submitted['task_id']
                 manager.records[task_id] = manager.records.pop(f'{round_id}_{side}')
                 self.tasks[task_id]['round_id'] = round_id
                 self.tasks[task_id]['alternative'] = side
+                self.tasks[task_id]['worker_deadline'] = worker_deadline
                 round_record['task_ids'].append(task_id)
         self.trace.event('comparison_round_started', parent_task_id=parent_task_id,
-                         round_id=round_id, checkpoint=checkpoint, task_ids=round_record['task_ids'])
+                         round_id=round_id, checkpoint=checkpoint, task_ids=round_record['task_ids'],
+                         stage_id=stage_id, review_reserve_seconds=review_reserve)
         return {'round_id': round_id, 'status': round_record['status'], 'checkpoint': checkpoint,
+                'acceptance_checks': criterion_catalog(acceptance_checks), 'stage_id': stage_id,
                 'workers': [self._snapshot(self.tasks[key]) for key in round_record['task_ids']]}
 
     def finished_round(self, round_id):
@@ -503,25 +715,50 @@ class TaskScheduler:
         self.trace.event('comparison_round_rejected', round_id=round_id, reason=reason)
         return {'round_id': round_id, 'status': 'rejected', 'checkpoint': record['checkpoint']}
 
-    def promote_comparison(self, round_id, task_id, fingerprint, message, rationale):
+    def promote_comparison(self, round_id, task_id, fingerprint, message, rationale, acceptance=None, decision='accept'):
         record = self.finished_round(round_id)
         if task_id not in record['task_ids']:
             raise PublicToolError('invalid_comparison_candidate', 'Winner must be one of this round\'s two workers.')
         for key in record['task_ids']:
             saved = self.workspaces.records.get(key)
-            if saved and saved['artifact'] is not None and not saved['reviewed']:
+            if saved and saved['artifact'] is not None and saved['artifact']['paths'] and not saved['reviewed']:
                 raise PublicToolError('worker_review_required', 'Review both available alternatives before choosing the winner.')
+        if decision not in {'accept', 'checkpoint'}:
+            raise PublicToolError('invalid_acceptance_decision', 'Choose accept or checkpoint.')
+        if decision == 'checkpoint':
+            review = self.workspaces.review(task_id)
+            if review['fingerprint'] != fingerprint:
+                raise PublicToolError('stale_worker_review', 'Review the current candidate before saving its checkpoint.')
+            result = {'round_id': round_id, 'task_id': task_id, 'status': 'checkpointed',
+                      'acceptance_status': 'pending', 'promoted': False, 'workspace_changed': False,
+                      'artifact_file': self.tasks[task_id]['changes']['artifact_file'], 'fingerprint': fingerprint,
+                      'remaining_work': rationale}
+            record.update(status='checkpointed', candidate=task_id, rationale=rationale)
+            self.tasks[task_id]['acceptance_status'] = 'pending'
+            self.trace.tasks[task_id]['acceptance_status'] = 'pending'
+            self.active_round_id = None
+            self.trace.event('comparison_checkpoint_saved', **result)
+            return result
+        def review_file(path):
+            candidate = self.workspaces.records[task_id]['repository']
+            target = candidate.policy.resolve_read(path)
+            if not target.is_file():
+                raise PublicToolError('invalid_acceptance_file', 'Review evidence must name a file, not a directory.')
+        acceptance = validate_acceptance(record['acceptance_checks'], acceptance,
+                                         self.app.repository.checks, review_file=review_file)
         deadline = self.turn_deadline
         if deadline is not None:
             deadline -= self.app.settings['execution'].get('verification_report_reserve_seconds', 15)
         result = self.workspaces.promote(task_id, fingerprint, message, record['checkpoint'], deadline)
         if result['promoted']:
-            record.update(status='promoted', winner=task_id, commit=result.get('commit'), rationale=rationale)
+            record.update(status='promoted', winner=task_id, commit=result.get('commit'), rationale=rationale, acceptance=acceptance)
+            self.tasks[task_id]['acceptance_status'] = 'accepted'
+            self.trace.tasks[task_id]['acceptance_status'] = 'accepted'
             self.active_round_id = None
         self.trace.event('comparison_candidate_decided', round_id=round_id, candidate=task_id,
-                         rationale=rationale, promoted=result['promoted'], rolled_back=result['rolled_back'],
+                         rationale=rationale, acceptance=acceptance, promoted=result['promoted'], rolled_back=result['rolled_back'],
                          commit=result.get('commit'), error=result.get('error'))
-        return {'round_id': round_id, **result}
+        return {'round_id': round_id, 'acceptance_status': 'accepted' if result['promoted'] else 'pending', **result}
 
     async def _run_worker(self, record, description):
         label = record["agent"]
@@ -578,7 +815,7 @@ class TaskScheduler:
                 self.trace, task_id, max_calls=record["allocated_calls"],
                 label=label,
                 final_answer_target_tokens=record["report_target_tokens"],
-                turn_deadline=self.turn_deadline, on_draft=save_draft,
+                turn_deadline=record.get('worker_deadline', self.turn_deadline), on_draft=save_draft,
                 mutation_requested=record['mode'] == 'implementation')
         except asyncio.CancelledError:
             record["status"] = "cancelled"
@@ -612,6 +849,8 @@ class TaskScheduler:
             self.trace.finish_task(task_id, "failed", record["error_type"])
         else:
             record["status"] = result["status"]
+            record['stop_reason'] = result.get('stop_reason') or record['stop_reason']
+            self.trace.tasks[task_id]['stop_reason'] = record['stop_reason']
             record['verification'] = result.get('verification')
             record["result_status"] = result["status"]
             record["result_source"] = result.get("result_source", "final")
@@ -669,6 +908,7 @@ class TaskScheduler:
                   "mode": record.get('mode', 'research'),
                   "status": record["status"],
                   "execution_status": record["status"],
+                  "acceptance_status": record.get("acceptance_status", "not_assessed"),
                   "result_status": record["result_status"],
                   "result_source": record["result_source"],
                   "stop_reason": record["stop_reason"],
@@ -688,7 +928,24 @@ class TaskScheduler:
             result['verification'] = record['verification']
         if record.get('round_id'):
             result.update(round_id=record['round_id'], alternative=record['alternative'])
+        if record.get('stop_reason') == 'no_progress':
+            result['retry_guidance'] = 'Reduce scope to one smaller checkable capability, list deferred requirements, and allocate its budget. Do not repeat the previous scope.'
         return result
+
+    def reference_state(self):
+        return {'active_round_id': self.active_round_id,
+                'tasks': [{'task_id': key, 'agent': record['agent'],
+                           'status': record['status'], 'collected': record['collected'],
+                           'round_id': record.get('round_id'),
+                           'changes_available': record.get('changes') is not None}
+                          for key, record in self.tasks.items()]}
+
+    def validate_task_references(self, task_ids):
+        if any(key not in self.tasks for key in task_ids):
+            raise PublicToolError('unknown_task_id',
+                'Unknown delegated task ID. Copy an exact task_id from the current task state; '
+                'this does not mean workers or review tools failed.',
+                current_state=self.reference_state())
 
     async def wait(self, task_ids=None, return_when="all", timeout_seconds=60,
                    *, until_event=False, deadline=None):
@@ -706,8 +963,7 @@ class TaskScheduler:
         selected_ids = list(dict.fromkeys(task_ids or default_ids or self.tasks.keys()))
         if not selected_ids:
             raise ValueError("No delegated tasks are available to wait for.")
-        if any(task_id not in self.tasks for task_id in selected_ids):
-            raise ValueError("Unknown delegated task ID.")
+        self.validate_task_references(selected_ids)
         pending = [self.tasks[task_id]["asyncio_task"] for task_id in selected_ids
                    if not self.tasks[task_id]["asyncio_task"].done()]
         timed_out = False
@@ -797,7 +1053,7 @@ class Orchestra:
         self.local_tool_semaphore = asyncio.Semaphore(tool_limits.get('max_parallel_local_tools', 4))
         self.write_lock = asyncio.Lock()
         self.clients = {}
-        self.dashboard = AgentDashboard()
+        self.dashboard = AgentDashboard(settings.get('ui', {}).get('recent_actions', 8))
         self.logs_path = BASE / "logs"
         self.logs_path.mkdir(exist_ok=True)
 
@@ -939,10 +1195,12 @@ class Orchestra:
             return {key: result.get(key) for key in ('task_id', 'changed_paths', 'truncated', 'fingerprint', 'applied', 'transfer_supported')}
         if name == 'start_comparison_round':
             return {'round_id': result.get('round_id'), 'checkpoint': result.get('checkpoint'),
-                    'worker_task_ids': [worker['task_id'] for worker in result.get('workers', [])]}
+                    'worker_task_ids': [worker['task_id'] for worker in result.get('workers', [])],
+                    'acceptance_checks': result.get('acceptance_checks', [])}
         if name == 'promote_candidate':
             return {key: result.get(key) for key in ('round_id', 'task_id', 'promoted', 'rolled_back',
-                'workspace_changed', 'commit', 'files', 'files_changed', 'error', 'rollback_error')}
+                'workspace_changed', 'commit', 'files', 'files_changed', 'error', 'rollback_error',
+                'status', 'acceptance_status', 'artifact_file', 'remaining_work')}
         if name in EDIT_TOOL_NAMES or name == 'apply_task_changes':
             return {"files": result.get("files", []),
                     "files_changed": result.get("files_changed", 0),
@@ -968,6 +1226,9 @@ class Orchestra:
         return {"result_type": type(result).__name__}
 
     def print_usage_summary(self, turn_usage):
+        count = AgentDashboard.token_count
+        def tokens(entry, key):
+            return ('unknown' if entry['api_calls'] and not entry['reported_calls'] else count(entry[key]))
         if not turn_usage:
             print("\nToken usage: no API calls were made.")
             return
@@ -976,6 +1237,7 @@ class Orchestra:
             "prompt_tokens", "completion_tokens", "total_tokens",
             "reasoning_tokens", "cached_tokens")}
         total_cost = 0.0
+        priced_reported_calls = 0
         all_costs_known = True
         for label, entry in turn_usage.items():
             for name in totals:
@@ -983,24 +1245,36 @@ class Orchestra:
             missing = entry["api_calls"] - entry["reported_calls"]
             suffix = f" | usage missing for {missing} call(s)" if missing else ""
             cost = self.estimated_cost(entry)
+            if missing:
+                all_costs_known = False
             if cost is None:
                 all_costs_known = False
-                cost_text = ""
+                cost_text = " | estimated=unknown (pricing unavailable)"
             else:
                 total_cost += cost
-                cost_text = f" | estimated=${cost:.5f}"
+                priced_reported_calls += entry['reported_calls']
+                cost_text = (f" | estimated_known=${cost:.5f}" if missing and entry['reported_calls']
+                             else ' | estimated=unknown' if missing else f" | estimated=${cost:.5f}")
             print(f"  {label} ({entry['provider']} / {entry['model']}): "
-                  f"calls={entry['api_calls']} | input={entry['prompt_tokens']} "
-                  f"(cached={entry['cached_tokens']}) | output={entry['completion_tokens']} "
-                  f"(reasoning={entry['reasoning_tokens']}) | total={entry['total_tokens']}"
+                  f"calls={entry['api_calls']} | input={tokens(entry, 'prompt_tokens')} "
+                  f"(cached={tokens(entry, 'cached_tokens')}) | output={tokens(entry, 'completion_tokens')} "
+                  f"(reasoning={tokens(entry, 'reasoning_tokens')}) | total={tokens(entry, 'total_tokens')}"
                   f"{cost_text}{suffix}")
         missing = totals["api_calls"] - totals["reported_calls"]
         suffix = f" | usage missing for {missing} call(s)" if missing else ""
-        total_cost_text = f" | estimated=${total_cost:.5f}" if all_costs_known else ""
-        print(f"  TOTAL: calls={totals['api_calls']} | input={totals['prompt_tokens']} "
-              f"(cached={totals['cached_tokens']}) | output={totals['completion_tokens']} "
-              f"(reasoning={totals['reasoning_tokens']}) | total={totals['total_tokens']}"
+        if all_costs_known:
+            total_cost_text = f" | estimated=${total_cost:.5f}"
+        elif priced_reported_calls:
+            total_cost_text = f" | estimated_known=${total_cost:.5f} (partial; full cost unknown)"
+        else:
+            total_cost_text = ' | estimated=unknown'
+        total_line = (f"TOTAL: calls={totals['api_calls']} | input={tokens(totals, 'prompt_tokens')} "
+              f"(cached={tokens(totals, 'cached_tokens')}) | output={tokens(totals, 'completion_tokens')} "
+              f"(reasoning={tokens(totals, 'reasoning_tokens')}) | total={tokens(totals, 'total_tokens')}"
               f"{total_cost_text}{suffix}")
+        self.dashboard.console.rule('FINAL TOTAL', characters='=', style='bold cyan')
+        self.dashboard.console.print(Text(total_line, style='bold cyan'))
+        self.dashboard.console.rule(characters='=', style='cyan')
 
     async def request(self, role, messages, tools, resource_status, turn_usage,
                       trace, task_id, label=None, force_final=False,
@@ -1011,6 +1285,7 @@ class Orchestra:
         provider_name = settings["provider"]
         usage_entry = self.begin_usage(turn_usage, label, role,
                                        provider_name, settings["model"])
+        self.dashboard.set_usage(label, usage_entry, pending=True)
         if provider_name not in self.clients:
             provider = self.config["providers"][provider_name]
             self.clients[provider_name] = AsyncOpenAI(api_key=provider["api_key"],
@@ -1125,7 +1400,8 @@ class Orchestra:
                 message["tool_calls"] = [calls[i] for i in sorted(calls)]
             return message
         except asyncio.CancelledError:
-            error_type = "CancelledError"
+            error_type = ('TimeoutError' if request_deadline is not None
+                          and time.monotonic() >= request_deadline else 'CancelledError')
             raise
         except Exception as error:
             error_type = type(error).__name__
@@ -1136,6 +1412,7 @@ class Orchestra:
             duration = time.monotonic() - start
             activity = "request failed" if error_type else "response received"
             self.add_usage(usage_entry, usage, actual_model)
+            self.dashboard.set_usage(label, usage_entry, pending=False)
             current_cost = self.estimated_cost(usage_entry) if usage is not None else None
             self.dashboard.update(label, depth, activity, received,
                                   "failed" if error_type else "running",
@@ -1201,6 +1478,8 @@ class Orchestra:
                           'message': 'Configured check failed to execute. Verification did not pass.'}
             trace.record_tool(task_id, label, tool_id, None, 'run_check', args,
                               time.monotonic() - started, output['ok'], summary, error_type)
+            self.dashboard.tool_finished(label, 'run_check', args, output,
+                                         time.monotonic() - started)
             trace.event('automatic_verification_finished', task_id=task_id,
                         check=name, passed=verification.results[name]['passed'])
             # This is local tool evidence, not an instruction from a repository.
@@ -1289,8 +1568,18 @@ class Orchestra:
         implementation_recoveries = 0
         implementation_recovery_mode = False
         recovery_exhausted = False
+        task_reference_failures = 0
+        task_reference_exhausted = False
         implementation_draft = None
         recovery_limit = self.settings['execution'].get('max_implementation_recoveries', 1)
+        role_policy = self.settings.get('roles', {}).get(role, {})
+        progress = EditProgress(role_policy.get('no_progress', {}),
+                                active=mutation_requested and (editing_worker or
+                                    (role == 'director' and director_file_editing and not comparison)))
+        no_progress_final = False
+        trace.event('progress_policy', task_id=task_id, enabled=progress.enabled,
+                    role=role, policy=role_policy.get('no_progress', {}),
+                    thinking=role_policy.get('thinking', 'enabled'))
         report_next = False
         workers_collected_for_final = False
         implementation_phase_announced = False
@@ -1328,6 +1617,8 @@ class Orchestra:
                             reason=reason, max_attempts=recovery_limit)
 
         def implementation_fallback(reason, draft=None):
+            if no_progress_final:
+                reason = 'no_progress'
             state = verification.summary()
             if role == 'director':
                 trace.verification = state
@@ -1347,21 +1638,84 @@ class Orchestra:
                 raise RuntimeError("Shared API call limit reached.")
             deadline_final = (role == "director" and finalization_deadline is not None
                               and time.monotonic() >= finalization_deadline)
-            force_final = (implementation_blocker is not None or recovery_final or recovery_exhausted or report_next or deadline_final
+            remaining_calls = min(call_limit - step, budget['calls'])
+            policy = role_policy.get('no_progress', {})
+            report_calls = policy.get('report_reserve_calls', 1)
+            report_seconds = policy.get('report_reserve_seconds', 30)
+            state = verification.summary()
+            passed = {item['name'] for item in state['checks']
+                      if item['passed'] and item['revision'] == state['workspace_revision']}
+            needs_checks = bool(set(verification.configured) - passed)
+            # A new edit could invalidate passing checks, so retain their
+            # reserve until implementation is closed, not just until one pass.
+            check_calls = policy.get('verification_reserve_calls', 1) if verification.configured else 0
+            check_seconds = policy.get('verification_reserve_seconds', 30) if verification.configured else 0
+            recovery_spare_calls = max(0, remaining_calls - report_calls - check_calls)
+            implementation_deadline = (turn_deadline - report_seconds - check_seconds
+                                       if turn_deadline is not None else None)
+            report_deadline = turn_deadline - report_seconds if turn_deadline is not None else None
+            reserve_verification = progress.enabled and (
+                recovery_spare_calls == 0 or (implementation_deadline is not None
+                                              and time.monotonic() >= implementation_deadline))
+            reserve_report = progress.enabled and (
+                remaining_calls <= report_calls or (report_deadline is not None
+                                                    and time.monotonic() >= report_deadline))
+            if reserve_verification and patch_succeeded:
+                progress.enter_stage('verification')
+                if state['status'] in {'passed', 'failed', 'not_configured'}:
+                    reserve_report = True
+            elif reserve_verification and progress.enabled and progress.state() not in {'verification', 'report'}:
+                progress.recover(calls=0, seconds=0)
+            if progress.state() == 'warn':
+                spare_seconds = (max(0, implementation_deadline - time.monotonic())
+                                 if implementation_deadline is not None else policy['recovery_seconds'])
+                progress.recover(calls=min(policy['recovery_calls'], recovery_spare_calls),
+                                 seconds=min(policy['recovery_seconds'], spare_seconds))
+                messages.append({'role': 'system', 'content':
+                    'NO-PROGRESS RECOVERY: shrink your next step to ONE checkable fragment. '
+                    'Use existing interfaces; one targeted read is allowed if necessary, then make '
+                    'a minimal coherent edit and check it. Do not design future features or write '
+                    'a giant patch. Report partial requirement coverage honestly. '
+                    + json.dumps({'policy': policy, 'effective_recovery': progress.snapshot(),
+                                  'reserved_calls': {'verification': check_calls, 'report': report_calls}})})
+                context = trace.draft_context(task_id, self.settings['execution'].get('draft_context_characters', 6000))
+                if isinstance(context, str) and context:
+                    messages.append({'role': 'user', 'content': context})
+                trace.event('no_progress_recovery_started', task_id=task_id, **progress.snapshot())
+            if progress.state() == 'exhausted' and not no_progress_final:
+                no_progress_final = True
+                messages.append({'role': 'system', 'content':
+                    'Stop implementation: no_progress recovery ended without a successful edit. '
+                    'Return a partial report with actual changes, checks, gaps and a smaller suggested next assignment.'})
+                trace.event('no_progress_stopped', task_id=task_id, **progress.snapshot())
+            force_final = (reserve_report or no_progress_final or implementation_blocker is not None or recovery_final or recovery_exhausted or task_reference_exhausted or report_next or deadline_final
                 or step == call_limit - 1
                 or (role == "director" and budget["calls"] <= final_threshold))
             director_calls_available = min(call_limit - step, budget["calls"])
             if (phase.enabled and patch_succeeded and implementation_blocker is None
-                    and verification.summary()['status'] in {'not_run', 'stale'}
-                    and (force_final or director_calls_available <= self.settings['execution'].get('verification_reserve_calls', 2))):
+                    and (verification.summary()['status'] in {'not_run', 'stale'} or needs_checks)
+                    and (force_final or reserve_verification or director_calls_available <= self.settings['execution'].get('verification_reserve_calls', 2))):
                 trace.event('verification_reserve_started', task_id=task_id,
                             calls_remaining=director_calls_available)
+                if progress.enabled:
+                    progress.enter_stage('verification')
+                check_turn_deadline = turn_deadline
+                if progress.enabled and turn_deadline is not None:
+                    check_turn_deadline -= max(0, report_seconds - self.settings['execution'].get('verification_report_reserve_seconds', 15))
                 await self.run_pending_checks(verification, messages, trace,
-                                              task_id, label, turn_deadline)
+                                              task_id, label, check_turn_deadline)
+                if progress.enabled:
+                    if reserve_verification or force_final:
+                        progress.enter_stage('report')
+                        reserve_report = force_final = True
+                    elif verification.summary()['status'] == 'failed':
+                        progress.enter_stage('repair')
                 # Checks may consume the research window; honor its deadline now.
                 deadline_final = (finalization_deadline is not None
                                   and time.monotonic() >= finalization_deadline)
                 force_final = force_final or deadline_final
+            if progress.enabled and force_final:
+                progress.enter_stage('report')
             if patch_succeeded:
                 phase.enter("patch_applied")
             phase.update(director_calls_available)
@@ -1436,6 +1790,7 @@ class Orchestra:
                     f"delegations available={0 if phase.active else max_delegations}; "
                     f"worker calls allocatable={worker_calls_available}; "
                     f"per-worker maximum={maximum_steps}; required workers={worker_task_status}; "
+                    f"current task state={json.dumps(scheduler.reference_state()) if scheduler is not None else 'none'}; "
                     f"implementation workers enabled={self.settings.get('roles', {}).get('worker', {}).get('allow_editing', False)}; "
                     f"development strategy={self.settings['execution'].get('development_strategy', 'direct')}; "
                     f"comparison rounds remaining={max(0, self.settings['execution'].get('max_comparison_rounds', 3) - len(scheduler.rounds)) if comparison and scheduler is not None else 'not applicable'}; "
@@ -1468,8 +1823,18 @@ class Orchestra:
                 research_seconds_remaining=seconds_remaining(research_deadline),
                 turn_seconds_remaining=seconds_remaining(turn_deadline),
             )
+            if progress.enabled:
+                resource_status += ' Edit progress policy=' + json.dumps(role_policy['no_progress']) + '; state=' + json.dumps(progress.snapshot())
+            if role == 'director' and comparison and scheduler is not None:
+                accepted = [{'stage_id': r.get('stage_id'), 'round_id': r['round_id'],
+                             'commit': r.get('commit')}
+                            for r in scheduler.rounds.values() if r['status'] == 'promoted']
+                resource_status += ' Accepted rounds (authoritative runtime state)=' + json.dumps(accepted)
             if force_final:
                 finalization_reason = (
+                    'no_progress' if no_progress_final else
+                    'verification_report_reserve' if reserve_report else
+                    'task_reference_errors' if task_reference_exhausted else
                     'finalization_deadline' if deadline_final else
                     'call_budget' if role == 'director' and budget['calls'] <= final_threshold else
                     'agent_step_limit' if step == call_limit - 1 else
@@ -1493,13 +1858,40 @@ class Orchestra:
             if phase.enabled and phase.workflow == 'focused' and not phase.active and not force_final:
                 request_deadline = min(phase.deadline, request_deadline or float("inf"))
                 phase.research_calls += 1
+            if progress.enabled and not force_final:
+                # Edit-gap thresholds are evaluated between complete responses.
+                # Never discard an in-flight patch merely because no edit has
+                # been executed while the model is still generating it.
+                limits = [value for value in (request_deadline,
+                          report_deadline if progress.stage == 'verification' else implementation_deadline)
+                          if value is not None]
+                request_deadline = min(limits) if limits else None
+            no_progress_recovery = progress.state() == 'recovery'
+            progress.calls += 1
+            thinking_mode = ('report_thinking' if force_final else 'recovery_thinking'
+                             if phase.active or implementation_recovery_mode or no_progress_recovery
+                             else 'thinking')
+            thinking_default = 'enabled' if thinking_mode == 'thinking' else 'disabled'
             try:
-                message = await self.request(
-                    role, messages, active_tools, resource_status, turn_usage, trace,
-                    task_id, label, force_final, thinking_enabled=not force_final and not phase.active and not implementation_recovery_mode,
-                    max_completion_tokens=request_limit,
-                    request_deadline=request_deadline)
+                # Enforce the deadline on the await itself, including adapters
+                # that do not implement their own transport timeout correctly.
+                timeout = (max(0.001, request_deadline - time.monotonic())
+                           if progress.enabled and request_deadline is not None else None)
+                async with asyncio.timeout(timeout):
+                    message = await self.request(
+                        role, messages, active_tools, resource_status, turn_usage, trace,
+                        task_id, label, force_final, thinking_enabled=role_policy.get(thinking_mode, thinking_default) == 'enabled',
+                        max_completion_tokens=request_limit,
+                        request_deadline=request_deadline)
             except (TimeoutError, APIConnectionError) as error:
+                if progress.enabled and not force_final:
+                    interruption_reason = ('connection' if isinstance(error, APIConnectionError)
+                        else 'runtime_deadline' if request_deadline is not None
+                            and time.monotonic() >= request_deadline else 'request_timeout')
+                    trace.event('request_interrupted', task_id=task_id,
+                                reason=interruption_reason,
+                                error_type=type(error).__name__, **progress.snapshot())
+                    continue
                 can_recover = (not force_final and step < call_limit - 1
                                and budget["calls"] > 0)
                 if phase.enabled:
@@ -1520,6 +1912,11 @@ class Orchestra:
                 raise
             truncated = message.pop("_truncated", False)
             partial = message.pop("_partial", False)
+            if truncated and progress.enabled and not force_final:
+                implementation_draft = message.get('content') or implementation_draft
+                if on_draft and message.get('content'):
+                    on_draft(message['content'])
+                continue
             if truncated:
                 if partial and message.get("content") and on_draft:
                     on_draft(message["content"])
@@ -1561,6 +1958,8 @@ class Orchestra:
                 return implementation_fallback('unexpected_final_tool_call', message.get('content'))
             if not calls:
                 if phase.enabled and not patch_succeeded and implementation_blocker is None and not force_final:
+                    if progress.enabled:
+                        continue
                     recover_implementation('no_edit')
                     trace.event("implementation_answer_rejected", task_id=task_id)
                     continue
@@ -1603,7 +2002,8 @@ class Orchestra:
                     trace.verification = verification_result
                     trace.event('verification_summary', task_id=task_id, **verification_result)
                 return {"answer": message.get("content") or "No answer text received.",
-                        "status": "partial" if blockers or incomplete_mutation or implementation_blocker is not None or recovery_exhausted or (comparison and scheduler is not None and scheduler.active_round_id is not None) else "completed",
+                        "status": "partial" if no_progress_final or blockers or incomplete_mutation or implementation_blocker is not None or recovery_exhausted or task_reference_exhausted or (comparison and scheduler is not None and scheduler.active_round_id is not None) else "completed",
+                        "stop_reason": 'no_progress' if no_progress_final else finalization_reason if force_final else None,
                         "verification": verification_result,
                         "result_source": ("final" if force_final or can_edit
                                           else "draft")}
@@ -1677,8 +2077,12 @@ class Orchestra:
                 delegate_allocations[id(call)] = (requested_calls, report_target)
             max_delegations -= len(delegate_allocations)
 
+            coordinator_recovered = False
+
             async def execute(call):
                 nonlocal patch_succeeded, implementation_blocker, edit_unresolved, implementation_recoveries, implementation_recovery_mode
+                nonlocal task_reference_failures, task_reference_exhausted
+                nonlocal coordinator_recovered
                 name = call["function"]["name"]
                 tool_started = time.monotonic()
                 tool_event_id = trace.new_id("tool")
@@ -1698,6 +2102,8 @@ class Orchestra:
                     if name not in tool_definitions:
                         raise PublicToolError('tool_unavailable', 'This tool is not available for this role or workspace. Use an exposed tool.')
                     validate_arguments(tool_definitions[name], args)
+                    self.dashboard.update(label, trace.tasks[task_id]['depth'],
+                                          self.dashboard.describe_tool(name, args))
                     if blocker_in_batch and len(calls) != 1:
                         raise PublicToolError('conflicting_actions', 'report_blocker must be the only tool call in its response; it ends tool use.')
                     if len(calls) != 1 and any(c['function']['name'] in {'create_commit', 'git_create_branch'} for c in calls):
@@ -1709,6 +2115,9 @@ class Orchestra:
                     if comparison and scheduler is not None and scheduler.active_round_id is not None and name in {'git_create_branch', 'create_commit'}:
                         raise PublicToolError('comparison_round_active', 'Keep the accepted branch unchanged until the active round is promoted or rejected.')
                     phase.admit(name, args)
+                    if role == 'director' and scheduler is not None and name in {
+                            'review_task_changes', 'apply_task_changes', 'promote_candidate'}:
+                        scheduler.validate_task_references([args['task_id']])
                     if name == "report_blocker" and can_edit:
                         implementation_blocker = validate_blocker(args)
                         trace.event("implementation_blocked", task_id=task_id, **implementation_blocker)
@@ -1718,6 +2127,13 @@ class Orchestra:
                             raise PublicToolError('scheduler_unavailable', 'Comparison workers require the task scheduler.')
                         if name == 'start_comparison_round':
                             result = await scheduler.start_comparison(**args, parent_task_id=task_id)
+                            self.dashboard.register_round(result['round_id'], result['workers'])
+                            if comparison and implementation_recovery_mode:
+                                implementation_recovery_mode = False
+                                implementation_recoveries = 0
+                                coordinator_recovered = True
+                                trace.event('implementation_recovery_progress', task_id=task_id,
+                                            tool=name, reason='comparison_round_started')
                         elif name == 'reject_comparison_round':
                             result = scheduler.reject_comparison(**args)
                         else:
@@ -1729,6 +2145,10 @@ class Orchestra:
                                     result = await operation
                                     cancellation_pending = True
                             for checked in result.get('checks', []):
+                                self.dashboard.tool_finished(label, 'run_check',
+                                    {'name': checked['name']},
+                                    {'ok': not bool(checked.get('error')), 'result': checked,
+                                     'error': checked.get('error')}, checked.get('duration_seconds', 0))
                                 summary = self.tool_result_summary('run_check', checked)
                                 trace.record_tool(task_id, label, trace.new_id('tool'), None,
                                     'run_check', {'name': checked['name'], 'candidate_task_id': args['task_id']},
@@ -1807,6 +2227,10 @@ class Orchestra:
                             raise PublicToolError("check_requires_completed_patch",
                                 "Call run_check in a later response after the editing tool has returned. Checks must verify the resulting files.")
                         if name in EDIT_TOOL_NAMES or name in {'run_check', 'prepare_commit', 'create_commit', 'git_create_branch'}:
+                            prior_check = verification.results.get(args.get('name')) if name == 'run_check' else None
+                            if (name == 'run_check' and patch_succeeded and progress.enabled
+                                    and (prior_check is None or prior_check['revision'] != verification.revision)):
+                                progress.enter_stage('verification')
                             async with self.write_lock:
                                 phase.admit(name, args)
                                 if name == 'create_commit' and commit_mode == 'autonomous':
@@ -1833,6 +2257,7 @@ class Orchestra:
                                 self.files.execute, name, args)
                     result_summary = self.tool_result_summary(name, result)
                     if name in EDIT_TOOL_NAMES or name == 'apply_task_changes':
+                        progress.edited()
                         patch_succeeded = True
                         edit_unresolved = False
                         verification.edited()
@@ -1843,10 +2268,23 @@ class Orchestra:
                         implementation_recovery_mode = False
                     elif name == 'run_check':
                         verification.checked(args['name'], result.get('passed') is True)
+                        if progress.enabled and patch_succeeded and verification.summary()['status'] == 'failed':
+                            progress.enter_stage('repair')
                     output = {"ok": True, "result": model_result(name, result)}
+                    if name in {'review_task_changes', 'apply_task_changes', 'promote_candidate'}:
+                        task_reference_failures = 0
                 except PublicToolError as error:
+                    if error.code == 'unknown_task_id':
+                        task_reference_failures += 1
+                        limit = self.settings['execution'].get('task_reference_retry_limit', 3)
+                        task_reference_exhausted = task_reference_failures >= limit
+                        trace.event('task_reference_error', task_id=task_id,
+                                    failures=task_reference_failures, limit=limit,
+                                    finalizing=task_reference_exhausted)
                     if name == 'run_check' and isinstance(args.get('name'), str) and args['name'] in self.repository.checks:
                         verification.checked(args['name'], False)
+                        if progress.enabled and patch_succeeded:
+                            progress.enter_stage('repair')
                     if name in EDIT_TOOL_NAMES or name == 'apply_task_changes':
                         edit_unresolved = True
                     tool_error = error.code
@@ -1855,11 +2293,18 @@ class Orchestra:
                                           f"tool rejected · {name}")
                     output = {"ok": False, "error": error.code,
                               "message": str(error), "details": error.details}
+                    if error.code == 'unknown_task_id':
+                        output['recovery'] = (
+                            'Task reference retry limit reached. Return a partial report using actual saved results; '
+                            'do not claim the available worker results are missing.' if task_reference_exhausted else
+                            'Use current_state task IDs. Finished workers can be reviewed now; do not keep waiting for them.')
                     if name in phase.disabled_edits:
                         output["recovery"] = "This editing tool is now disabled for the turn after repeated errors. Use the other editing tool or report_blocker; do not repeat this call."
                 except Exception as error:
                     if name == 'run_check' and isinstance(args.get('name'), str) and args['name'] in self.repository.checks:
                         verification.checked(args['name'], False)
+                        if progress.enabled and patch_succeeded:
+                            progress.enter_stage('repair')
                     if name in EDIT_TOOL_NAMES or name == 'apply_task_changes':
                         edit_unresolved = True
                     tool_error = type(error).__name__
@@ -1871,6 +2316,8 @@ class Orchestra:
                 trace.record_tool(task_id, label, tool_event_id, call["id"], name,
                                   args, time.monotonic() - tool_started,
                                   output["ok"], result_summary, tool_error)
+                self.dashboard.tool_finished(label, name, args, output,
+                                             time.monotonic() - tool_started)
                 if cancellation_pending:
                     raise asyncio.CancelledError
                 return {"role": "tool", "tool_call_id": call["id"],
@@ -1878,10 +2325,45 @@ class Orchestra:
 
             results = await asyncio.gather(*(execute(call) for call in calls))
             messages.extend(results)
+            if coordinator_recovered:
+                messages.append({'role': 'system', 'content':
+                    'Coordinator recovery completed: the comparison round started successfully. '
+                    'Resume normal coordination and reasoning; use actual returned task IDs. '
+                    'The director need not edit files to exit recovery in comparison mode.'})
+            if (role == 'director' and comparison and scheduler is not None
+                    and self.settings['execution'].get('compact_completed_round_reviews', False)):
+                for call, response in zip(calls, results):
+                    if call['function']['name'] not in {'promote_candidate', 'reject_comparison_round'}:
+                        continue
+                    output = json.loads(response['content'])
+                    decision = output.get('result') or {}
+                    if (not output.get('ok') or not
+                            (decision.get('promoted') is True or decision.get('status') in {'rejected', 'checkpointed'})):
+                        continue
+                    record = scheduler.rounds.get(decision.get('round_id'))
+                    if not record or record['status'] not in {'promoted', 'rejected', 'checkpointed'}:
+                        continue
+                    archive = trace.directory / 'context' / (trace.new_id('reviews') + '.json')
+                    try:
+                        stats = compact_round_reviews(messages, set(record['task_ids']),
+                            record['round_id'], archive,
+                            self.settings['execution'].get('compact_review_min_characters', 4000))
+                    except OSError as error:
+                        trace.event('context_compaction_skipped', task_id=task_id,
+                                    round_id=record['round_id'], error_type=type(error).__name__)
+                    else:
+                        if stats:
+                            trace.event('context_compacted', task_id=task_id,
+                                round_id=record['round_id'], archive=str(archive), **stats)
         raise RuntimeError("Agent call limit reached without a final response.")
 
 
 def validate_settings(settings):
+    validate_role_policies(settings)
+    ui = settings.get('ui', {})
+    if (not isinstance(ui, dict) or type(ui.get('recent_actions', 8)) is not int
+            or not 0 <= ui.get('recent_actions', 8) <= 30):
+        raise ValueError('ui.recent_actions must be an integer from 0 to 30.')
     git = settings.get('git', {})
     if (not isinstance(git, dict) or set(git) - {'commit_mode', 'allow_branch_creation'}
             or not isinstance(git.get('commit_mode', 'manual'), str)
@@ -1889,6 +2371,14 @@ def validate_settings(settings):
             or type(git.get('allow_branch_creation', False)) is not bool):
         raise ValueError('git must contain commit_mode (manual/autonomous/disabled) and boolean allow_branch_creation.')
     execution = settings.get('execution', {})
+    reference_limit = execution.get('task_reference_retry_limit', 3)
+    if type(reference_limit) is not int or reference_limit < 1:
+        raise ValueError('execution.task_reference_retry_limit must be a positive integer.')
+    if type(execution.get('compact_completed_round_reviews', False)) is not bool:
+        raise ValueError('execution.compact_completed_round_reviews must be boolean.')
+    compact_limit = execution.get('compact_review_min_characters', 4000)
+    if type(compact_limit) is not int or not 1000 <= compact_limit <= 200000:
+        raise ValueError('execution.compact_review_min_characters must be an integer from 1000 to 200000.')
     if execution.get('development_strategy', 'direct') not in {'direct', 'comparison'}:
         raise ValueError('execution.development_strategy must be direct or comparison.')
     if execution.get('workflow', 'focused') not in {'focused', 'project'}:
@@ -1900,6 +2390,10 @@ def validate_settings(settings):
         if type(value) is not int or value < 1:
             raise ValueError(f'Invalid settings: execution.{key}')
     draft_limit = execution.get('draft_context_characters', 6000)
+    review_reserve = execution.get('comparison_review_reserve_seconds', 0)
+    if (type(review_reserve) not in (int, float) or not math.isfinite(review_reserve)
+            or review_reserve < 0 or review_reserve >= execution['turn_timeout_seconds'] - execution['finalization_reserve_seconds']):
+        raise ValueError('Invalid settings: execution.comparison_review_reserve_seconds')
     if type(draft_limit) is not int or not 0 <= draft_limit <= 20000:
         raise ValueError('execution.draft_context_characters must be an integer from 0 to 20000.')
     if execution.get('verification_reserve_calls', 2) >= execution.get('max_api_calls_per_turn', 16):

@@ -20,8 +20,10 @@ class Verification:
             status = 'not_configured'
         elif any(not r['passed'] for r in current):
             status = 'failed'
-        elif current:
+        elif len(current) == len(self.configured):
             status = 'passed'
+        elif current:
+            status = 'not_run'
         elif self.results:
             status = 'stale'
         else:

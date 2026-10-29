@@ -12,7 +12,7 @@ from execution_phase import ImplementationPhase
 from orchestra import validate_settings, validate_prompts, TaskScheduler
 from runtime_settings import load_runtime_settings
 from tools import FILE_TOOLS, DELEGATE_TOOL
-import test_base_tools
+from tests import test_base_tools
 
 
 class RuntimeProfiles(unittest.TestCase):
@@ -24,7 +24,7 @@ class RuntimeProfiles(unittest.TestCase):
         validate_prompts(json.loads(Path('prompts.json').read_text(encoding='utf-8')))
         self.assertEqual(standard['execution']['max_api_calls_per_turn'], 16)
         self.assertEqual(project['execution']['max_api_calls_per_turn'], 60)
-        self.assertEqual(project['execution']['turn_timeout_seconds'], 1800)
+        self.assertEqual(project['execution']['turn_timeout_seconds'], 2700)
         self.assertEqual(standard['git'], {'commit_mode': 'manual', 'allow_branch_creation': False})
         self.assertEqual(project['git'], {'commit_mode': 'autonomous', 'allow_branch_creation': True})
         self.assertFalse(standard['roles']['worker']['allow_editing'])

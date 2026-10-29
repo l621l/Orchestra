@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from git_tools import RepositoryTools
 from tool_errors import ToolError
-import test_base_tools
+from tests import test_base_tools
 
 
 class CommitTools(unittest.TestCase):

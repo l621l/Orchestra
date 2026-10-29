@@ -1,4 +1,7 @@
 {
+  "ui": {
+    "recent_actions": 8
+  },
   "api": {
     "timeout_seconds": 60,
     "request_timeout_seconds": 180,
@@ -31,7 +34,11 @@
     "edit_retry_limit": 2,
     "verification_reserve_calls": 2,
     "max_implementation_recoveries": 1,
-    "draft_context_characters": 6000
+    "draft_context_characters": 6000,
+    "compact_completed_round_reviews": false,
+    "compact_review_min_characters": 4000,
+    "task_reference_retry_limit": 3,
+    "comparison_review_reserve_seconds": 0
   },
   "checks": {
     "python_compile": [
@@ -45,11 +52,39 @@
   "roles": {
     "director": {
       "max_delegations": 2,
-      "allow_editing": true
+      "allow_editing": true,
+      "thinking": "enabled",
+      "recovery_thinking": "disabled",
+      "report_thinking": "disabled",
+      "no_progress": {
+        "enabled": false,
+        "calls_without_edit": 3,
+        "seconds_without_edit": 120,
+        "recovery_calls": 2,
+        "recovery_seconds": 90,
+        "verification_reserve_calls": 1,
+        "report_reserve_calls": 1,
+        "verification_reserve_seconds": 30,
+        "report_reserve_seconds": 30
+      }
     },
     "worker": {
       "max_delegations": 0,
-      "allow_editing": false
+      "allow_editing": false,
+      "thinking": "enabled",
+      "recovery_thinking": "disabled",
+      "report_thinking": "disabled",
+      "no_progress": {
+        "enabled": false,
+        "calls_without_edit": 3,
+        "seconds_without_edit": 120,
+        "recovery_calls": 2,
+        "recovery_seconds": 90,
+        "verification_reserve_calls": 1,
+        "report_reserve_calls": 1,
+        "verification_reserve_seconds": 30,
+        "report_reserve_seconds": 30
+      }
     }
   },
   "git": {
@@ -64,29 +99,56 @@
   "profiles": {
     "comparison": {
       "roles": {
-        "director": {"allow_editing": false},
-        "worker": {"allow_editing": true}
+        "director": {
+          "allow_editing": false
+        },
+        "worker": {
+          "allow_editing": true,
+          "no_progress": {
+            "enabled": true,
+            "calls_without_edit": 3,
+            "seconds_without_edit": 120,
+            "recovery_calls": 2,
+            "recovery_seconds": 90,
+            "verification_reserve_calls": 1,
+            "report_reserve_calls": 1,
+            "verification_reserve_seconds": 30,
+            "report_reserve_seconds": 30
+          }
+        }
       },
-      "git": {"commit_mode": "autonomous", "allow_branch_creation": false},
+      "git": {
+        "commit_mode": "autonomous",
+        "allow_branch_creation": false
+      },
       "execution": {
         "workflow": "project",
         "development_strategy": "comparison",
+        "compact_completed_round_reviews": true,
         "max_api_calls_per_turn": 60,
         "max_steps_per_agent": 12,
-        "turn_timeout_seconds": 1800,
+        "turn_timeout_seconds": 2700,
         "finalization_reserve_seconds": 120,
         "verification_report_reserve_seconds": 30,
         "implementation_reserve_calls": 6,
-        "verification_reserve_calls": 3
+        "verification_reserve_calls": 3,
+        "max_comparison_rounds": 10,
+        "comparison_review_reserve_seconds": 300
       },
       "checks": {
-        "python_tests": ["{python}", "-B", "-c",
-          "import sys, unittest; suite = unittest.defaultTestLoader.discover('tests'); count = suite.countTestCases(); print(f'Discovered {count} tests'); sys.exit(0 if count and unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)"]
+        "python_tests": [
+          "{python}",
+          "-B",
+          "-c",
+          "import sys, unittest; suite = unittest.defaultTestLoader.discover('tests'); count = suite.countTestCases(); print(f'Discovered {count} tests'); sys.exit(0 if count and unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1)"
+        ]
       }
     },
     "project": {
       "roles": {
-        "worker": {"allow_editing": true}
+        "worker": {
+          "allow_editing": true
+        }
       },
       "git": {
         "commit_mode": "autonomous",
@@ -96,7 +158,7 @@
         "workflow": "project",
         "max_api_calls_per_turn": 60,
         "max_steps_per_agent": 12,
-        "turn_timeout_seconds": 1800,
+        "turn_timeout_seconds": 2700,
         "finalization_reserve_seconds": 120,
         "verification_report_reserve_seconds": 30,
         "implementation_reserve_calls": 6,

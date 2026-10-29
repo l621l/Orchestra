@@ -13,7 +13,7 @@ from orchestra import TaskScheduler
 from runtime_settings import load_runtime_settings
 from tool_errors import ToolError
 from worker_workspaces import WorkerWorkspaces
-import test_base_tools
+from tests import test_base_tools
 
 
 class WorkspaceTransfer(unittest.TestCase):
@@ -439,7 +439,7 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
                     return self.response('create_file', {'path': 'new.py', 'content': 'value = 2\n'})
                 return {'role': 'assistant', 'content': 'Implemented.'}
             if index == 0:
-                return self.response('start_comparison_round', {
+                return self.response('start_comparison_round', {'acceptance_checks': ['Value is verified'],
                     'task': 'Implement one value.', 'max_calls_per_worker': 3,
                     'report_target_tokens': 500})
             current = scheduler.rounds[scheduler.active_round_id] if scheduler.active_round_id else None
@@ -448,7 +448,7 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
                 return self.response('review_task_changes', {'task_id': current['task_ids'][index - 1]})
             if index == 3:
                 chosen = current['task_ids'][0]
-                return self.response('promote_candidate', {
+                return self.response('promote_candidate', {'decision': 'accept', 'acceptance': [{'id': 'C1', 'check': 'unit', 'evidence': 'Configured unit check imports new.value and asserts its value.'}],
                     'round_id': current['round_id'], 'task_id': chosen,
                     'fingerprint': scheduler.workspaces.review(chosen)['fingerprint'],
                     'message': 'feat: accept value', 'rationale': 'Verified implementation.'})
@@ -506,7 +506,7 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
             names = {tool['function']['name'] for tool in args[2]}
             self.assertFalse({'create_file', 'replace_text', 'apply_patch', 'apply_task_changes', 'create_commit'} & names)
             if index in (0, 5):
-                return self.response('start_comparison_round', {'task': f'Implement milestone {index // 5 + 1}.',
+                return self.response('start_comparison_round', {'acceptance_checks': ['Value is verified'], 'task': f'Implement milestone {index // 5 + 1}.',
                     'max_calls_per_worker': 3, 'report_target_tokens': 500})
             if index in (1, 6):
                 return self.response('wait_tasks', {})
@@ -516,7 +516,7 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
                 return self.response('review_task_changes', {'task_id': current['task_ids'][offset]})
             if index in (4, 9):
                 choice = current['task_ids'][1 if index == 4 else 0]
-                return self.response('promote_candidate', {'round_id': current['round_id'], 'task_id': choice,
+                return self.response('promote_candidate', {'decision': 'accept', 'acceptance': [{'id': 'C1', 'check': 'unit', 'evidence': 'Configured unit check imports new.value and asserts its value.'}], 'round_id': current['round_id'], 'task_id': choice,
                     'fingerprint': scheduler.workspaces.review(choice)['fingerprint'],
                     'message': f'feat: accept milestone {index // 5 + 1}', 'rationale': 'Chosen complete candidate meets this milestone.'})
             return {'role': 'assistant', 'content': 'Two milestones accepted and committed.'}
@@ -558,7 +558,7 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
         self.app.settings = load_runtime_settings('settings.json', 'comparison')
         self.app.settings['execution']['max_comparison_rounds'] = 1
         self.app.run = AsyncMock(return_value={'answer': 'No changes proposed.', 'status': 'partial', 'result_source': 'final'})
-        started = await scheduler.start_comparison('Inspect implementation options.', 2, 500, self.task)
+        started = await scheduler.start_comparison('Inspect implementation options.', 2, 500, self.task, acceptance_checks=['Value is verified'])
         await scheduler.wait(timeout_seconds=20)
         before = self.app.repository._run(['rev-parse', 'HEAD'])['stdout']
         result = scheduler.reject_comparison(started['round_id'], 'Neither implements the requirement.')
@@ -566,7 +566,7 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(scheduler.active_round_id)
         self.assertEqual(self.app.repository._run(['rev-parse', 'HEAD'])['stdout'], before)
         with self.assertRaises(ToolError) as error:
-            await scheduler.start_comparison('Try again.', 2, 500, self.task)
+            await scheduler.start_comparison('Try again.', 2, 500, self.task, acceptance_checks=['Value is verified'])
         self.assertEqual(error.exception.code, 'comparison_round_limit')
 
     async def test_pair_budget_reserves_director_calls_before_starting_workers(self):
@@ -574,7 +574,7 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
         self.app.settings = load_runtime_settings('settings.json', 'comparison')
         before = scheduler.shared_budget['calls']
         with self.assertRaises(ToolError) as error:
-            await scheduler.start_comparison('Implement.', 12, 500, self.task)
+            await scheduler.start_comparison('Implement.', 12, 500, self.task, acceptance_checks=['Value is verified'])
         self.assertEqual(error.exception.code, 'batch_worker_budget_exceeded')
         self.assertEqual(scheduler.shared_budget['calls'], before)
         self.assertEqual(scheduler.tasks, {})
@@ -583,10 +583,14 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
         scheduler = self.prepare()
         self.app.settings = load_runtime_settings('settings.json', 'comparison')
         self.app.run = AsyncMock(return_value={'answer': 'No changes.', 'status': 'partial', 'result_source': 'final'})
-        started = await scheduler.start_comparison('Implement.', 2, 500, self.task)
+        started = await scheduler.start_comparison('Implement.', 2, 500, self.task, acceptance_checks=['Value is verified'])
         await scheduler.wait(timeout_seconds=20)
         chosen = started['workers'][0]['task_id']
         review = scheduler.workspaces.review(chosen)
+        other = started['workers'][1]['task_id']
+        repo = scheduler.workspaces.records[other]['repository']
+        repo.create_file('unreviewed.py', 'value = 1\n')
+        scheduler.workspaces.collect(other)
         with self.assertRaises(ToolError) as error:
             scheduler.promote_comparison(started['round_id'], chosen, review['fingerprint'], 'feat: accept', 'Prefer A.')
         self.assertEqual(error.exception.code, 'worker_review_required')
@@ -596,7 +600,7 @@ class ComparisonRuntime(unittest.IsolatedAsyncioTestCase):
         self.app.settings = load_runtime_settings('settings.json', 'comparison')
         self.app.request = AsyncMock(side_effect=[
             {'role': 'assistant', 'content': None, 'tool_calls': [
-                self.call('start_comparison_round', {'task': 'Implement.', 'max_calls_per_worker': 2, 'report_target_tokens': 500}),
+                self.call('start_comparison_round', {'acceptance_checks': ['Value is verified'], 'task': 'Implement.', 'max_calls_per_worker': 2, 'report_target_tokens': 500}),
                 self.call('read_file', {'path': 'baseline.txt'})]},
             self.response('report_blocker', {'reason': 'missing_information', 'evidence': 'No round started.', 'next_step': 'Start the round separately.'}),
             {'role': 'assistant', 'content': 'No round started.'}])

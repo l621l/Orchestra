@@ -2,7 +2,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import test_reliability
+from tests import test_reliability
 from execution_phase import ImplementationPhase, validate_blocker
 from tool_errors import ToolError
 

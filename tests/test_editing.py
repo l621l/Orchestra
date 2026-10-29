@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from git_tools import RepositoryTools
 from tool_errors import ToolError
-import test_execution_phase
+from tests import test_execution_phase
 
 
 class ReplacementTests(unittest.TestCase):
