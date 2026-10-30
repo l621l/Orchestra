@@ -39,6 +39,10 @@ def validate_arguments(tool, arguments):
                 if key in properties:
                     validate(item, properties[key], key)
         elif kind == 'array':
+            if len(value) > schema.get('maxItems', float('inf')):
+                reject(field, f'must contain at most {schema["maxItems"]} items.')
+            if len(value) < schema.get('minItems', 0):
+                reject(field, f'must contain at least {schema["minItems"]} items.')
             for item in value:
                 validate(item, schema['items'], field + ' item')
         elif kind in {'integer', 'number'}:

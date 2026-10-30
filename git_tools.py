@@ -7,6 +7,7 @@ import re
 import signal
 import difflib
 from tool_errors import ToolError
+from project_map import ProjectMap
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -28,7 +29,9 @@ GIT_TOOLS = [
     definition("replace_text", "Preferred for editing an existing UTF-8 file. Replace exactly one occurrence of old_text with new_text; include enough unchanged context to make old_text unique. Missing or ambiguous matches leave the file unchanged. Preserves LF/CRLF and does not stage or commit.",
                {"path": {"type": "string", "description": "Workspace-relative existing file."},
                 "old_text": {"type": "string", "description": "Exact non-empty unique fragment from the current file, without line-number prefixes."},
-                "new_text": {"type": "string", "description": "Replacement fragment; may be empty to remove the matched text."}},
+                "new_text": {"type": "string", "description": "Replacement fragment; may be empty to remove the matched text."},
+                "expected_sha256": {"type": "string", "minLength": 64, "maxLength": 64,
+                    "description": "Optional content_sha256 from read_file. Reject if the file changed since that read."}},
                ["path", "old_text", "new_text"]),
     definition("git_status", "Show the current branch and compact working-tree status, including untracked files.",
                {}, []),
@@ -46,13 +49,13 @@ GIT_TOOLS = [
                 "path": {"type": "string", "description": "Optional relative file or directory."},
                 "context_lines": {"type": "integer", "minimum": 0, "maximum": 20,
                                   "description": "Unchanged context lines; default 3."}}, ["revision"]),
-    definition("run_check", "Run one configured verification command by exact name, before editing for a baseline or after editing to verify the result. Call after the editing response has returned. Returns passed, returncode and bounded output. Failure does not revert files.",
+    definition("run_check", "Run one configured verification command by exact name, before editing for a baseline or after editing to verify the result. Runs in listed order; place it after edits to verify their result. Returns passed, returncode and bounded output. Failure does not revert files.",
                {"name": {"type": "string", "description": "Exact configured check name, for example python_compile."}}, ["name"]),
     definition("git_create_branch", "Create and switch to a NEW local branch from the current HEAD, including before the first commit. Call alone before implementation when branch creation is enabled by runtime policy. Preserves working files; refuses an existing branch or pre-existing staged changes. Cannot switch to an existing branch, reset history, merge, or push.",
                {"name": {"type": "string", "minLength": 1, "maxLength": 120,
                          "description": "New local branch name, for example feat/task-ledger."}}, ["name"]),
-    definition("prepare_commit", "Read-only: inspect changed paths, staged-change state, a bounded tracked diff, and a snapshot fingerprint. Read new files separately. Group related whole-file changes into one meaningful commit. Follow runtime commit policy; re-run after every edit or commit.", {}, []),
-    definition("create_commit", "Create one local commit from the latest prepare_commit fingerprint and selected whole-file paths. Follow runtime commit policy: autonomous mode permits verified milestones without asking; manual mode requires exact user approval. Refuses stale snapshots, pre-existing staged changes, or unprepared paths. Call alone after edits and checks. Never pushes or merges.",
+    definition("prepare_commit", "Read-only: inspect changed paths, staged-change state, a bounded tracked diff, and a snapshot fingerprint. Read new files separately. Group related whole-file changes into one meaningful commit. Re-run after every edit or commit.", {}, []),
+    definition("create_commit", "Create one local commit from the latest prepare_commit fingerprint and selected whole-file paths. Available only when Git mutations are enabled; requires successful configured checks after the latest edit. Refuses stale snapshots, pre-existing staged changes, or unprepared paths. Call alone after edits and checks. Never pushes or merges.",
                {"message": {"type": "string", "description": "Concise commit subject and optional body describing the completed change."},
                 "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1,
                           "description": "Related whole-file paths from prepare_commit, selected according to runtime policy."},
@@ -62,6 +65,20 @@ GIT_TOOLS = [
                {"patch": {"type": "string", "description": "Git-style unified diff; each file starts with diff --git a/path b/path."}},
                ["patch"]),
 ]
+
+# Semantic notes travel in the same edit call; no extra model round trip.
+INTERFACE_NOTES_SCHEMA = {
+    'type':'array','maxItems':8,'description':
+    'Optional short semantic notes about changed public interfaces. Stored only after a successful edit, with source hashes. Do not describe local variables.',
+    'items':{'type':'object','additionalProperties':False,'required':['path','symbol','note'],
+        'properties':{'path':{'type':'string','minLength':1,'maxLength':240},
+                      'symbol':{'type':'string','minLength':1,'maxLength':120},
+                      'note':{'type':'string','minLength':1,'maxLength':700},
+                      'related_paths':{'type':'array','maxItems':8,
+                                       'items':{'type':'string','minLength':1,'maxLength':240}}}}}
+for _tool in GIT_TOOLS:
+    if _tool['function']['name'] in EDIT_TOOL_NAMES:
+        _tool['function']['parameters']['properties']['interface_notes'] = INTERFACE_NOTES_SCHEMA
 
 REVISION_PATTERN = re.compile(r"^[0-9A-Za-z@][0-9A-Za-z._/@^~-]*$")
 
@@ -77,6 +94,8 @@ class RepositoryTools:
         self.policy = policy or WorkspacePolicy(root)
         self.root = self.policy.root
         self.checks = checks or {}
+        self.interface_map = ProjectMap(self.policy)
+        self.interface_memory_enabled = True
         try:
             probe = self._run(["rev-parse", "--show-toplevel"], check=False)
             discovered = probe["stdout"].strip()
@@ -197,6 +216,11 @@ class RepositoryTools:
         self._require_repository()
         if type(max_count) is not int or not 1 <= max_count <= 50:
             raise ToolError("invalid_arguments", "max_count must be an integer from 1 to 50.")
+        if self._run(['rev-parse', '--verify', 'HEAD'], check=False)['returncode']:
+            if path is not None:
+                self._relative_path(path)
+            return {'log': '', 'commits': 0, 'path': path, 'truncated': False,
+                    'message': 'Repository has no commits yet.'}
         arguments = ["log", "--no-decorate", "--date=iso-strict",
                      "--pretty=format:%H%x09%ad%x09%an%x09%s",
                      f"--max-count={max_count}"]
@@ -237,6 +261,25 @@ class RepositoryTools:
         return {"show": output, "revision": revision, "commit": resolved,
                 "path": safe_path, "truncated": truncated}
 
+    def _check_output(self, captured):
+        """Bound memory/output while retaining both setup and final traceback."""
+        captured.seek(0, os.SEEK_END)
+        size = captured.tell()
+        # Byte budget also bounds decoded characters, including malformed UTF-8.
+        cap = self.MAX_OUTPUT - 100
+        captured.seek(0)
+        if size <= cap:
+            return {'output': captured.read(cap).decode('utf-8', errors='replace'),
+                    'truncated': False, 'omitted_bytes': 0}
+        head_size = cap // 4
+        tail_size = cap - head_size
+        head = captured.read(head_size).decode('utf-8', errors='replace')
+        captured.seek(-tail_size, os.SEEK_END)
+        tail = captured.read(tail_size).decode('utf-8', errors='replace')
+        omitted = size - cap
+        return {'output': head + f'\n... [{omitted} bytes omitted] ...\n' + tail,
+                'truncated': True, 'omitted_bytes': omitted}
+
     def run_check(self, name, *, timeout_seconds=None):
         if not isinstance(name, str) or name not in self.checks:
             available = ", ".join(sorted(self.checks)) or "none"
@@ -269,13 +312,10 @@ class RepositoryTools:
                     if process.poll() is None:
                         process.kill()
                     process.wait(timeout=10)
-                raise ToolError('check_timeout', f'Check exceeded {timeout:g} seconds. Reduce its scope or fix the check before retrying.') from error
-            captured.seek(0)
-            combined = captured.read(self.MAX_OUTPUT * 4 + 4).decode('utf-8', errors='replace')
-        output, truncated = self._bounded(combined)
+                raise ToolError('check_timeout', f'Check exceeded {timeout:g} seconds. Reduce its scope or fix the check before retrying.', **self._check_output(captured)) from error
+            diagnostic = self._check_output(captured)
         return {'name': name, 'returncode': process.returncode,
-                'passed': process.returncode == 0, 'output': output,
-                'truncated': truncated}
+                'passed': process.returncode == 0, **diagnostic}
 
     def _commit_snapshot(self):
         self._require_repository()
@@ -468,9 +508,18 @@ class RepositoryTools:
             raise ToolError("invalid_patch", "A patch must affect between 1 and 30 accessible files.")
         return paths
 
+    @staticmethod
+    def _reject_archive_marker(text):
+        if any(marker in text for marker in ('[Archived executed payload.',
+                '[Earlier successful output archived in log]', '[Diff archived after round closure;')):
+            raise ToolError('archive_marker_not_source',
+                'Refused to write an internal context-archive marker as source. No files changed. '
+                'Read the current file; regenerate real complete code from the task instead of copying history placeholders.')
+
     def create_file(self, path, content):
         if not isinstance(content, str) or len(content) > self.MAX_PATCH or '\0' in content:
             raise ToolError('invalid_content', 'content must be UTF-8 text up to 200000 characters without NUL bytes.')
+        self._reject_archive_marker(content)
         target = self.policy.resolve_write(path)
         requested = self.root / self.policy.relative(path)
         if os.path.lexists(requested) or target.exists():
@@ -502,12 +551,13 @@ class RepositoryTools:
         relative = self.policy.relative(path).as_posix()
         return self._edit_result(relative, '', content, created=True, warnings=warnings)
 
-    def replace_text(self, path, old_text, new_text):
+    def replace_text(self, path, old_text, new_text, expected_sha256=None):
         if (not isinstance(old_text, str) or not old_text
                 or not isinstance(new_text, str)
                 or len(old_text) + len(new_text) > self.MAX_PATCH
                 or '\0' in old_text or '\0' in new_text):
             raise ToolError("invalid_replacement", "Provide non-empty old_text and new_text, together at most 200000 characters.")
+        self._reject_archive_marker(new_text)
         target = self.policy.resolve_write(path)
         if not target.is_file():
             raise ToolError("file_not_found", "replace_text requires an existing regular file.")
@@ -516,6 +566,11 @@ class RepositoryTools:
         if target.stat().st_size > 2_000_000:
             raise ToolError("file_too_large", "replace_text supports files up to 2000000 bytes.")
         original = target.read_bytes()
+        if expected_sha256 is not None:
+            if not isinstance(expected_sha256, str) or not re.fullmatch('[0-9a-f]{64}', expected_sha256):
+                raise ToolError('invalid_arguments', 'expected_sha256 must be the content_sha256 returned by read_file.')
+            if hashlib.sha256(original).hexdigest() != expected_sha256:
+                raise ToolError('file_changed', 'File changed since read_file. Read the current contents before editing.')
         try:
             text = original.decode("utf-8")
         except UnicodeDecodeError as error:
@@ -537,6 +592,7 @@ class RepositoryTools:
         if len(updated) > 2_000_000:
             raise ToolError("file_too_large", "Result exceeds 2000000 bytes.")
         temp_name = None
+        warnings = []
         try:
             with tempfile.NamedTemporaryFile(dir=target.parent, prefix=".orchestra-edit-", delete=False) as temp:
                 temp_name = temp.name
@@ -546,13 +602,21 @@ class RepositoryTools:
                 raise ToolError("file_changed", "File changed during editing. Read its current contents before retrying.")
             os.replace(temp_name, target)
         finally:
-            if temp_name and os.path.exists(temp_name):
-                os.unlink(temp_name)
+            if temp_name:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    warnings.append('Editing temporary file could not be removed.')
         relative = self.policy.relative(path).as_posix()
-        return self._edit_result(relative, text, updated.decode('utf-8'), replacements=1)
+        return self._edit_result(relative, text, updated.decode('utf-8'), replacements=1,
+                                 content_sha256=hashlib.sha256(updated).hexdigest(), warnings=warnings)
 
     def apply_patch(self, patch):
         paths = self._patch_paths(patch)
+        self._reject_archive_marker('\n'.join(line[1:] for line in patch.splitlines()
+                                               if line.startswith('+') and not line.startswith('+++')))
         options = ["apply", "--recount", "--whitespace=warn", "-"]
         checked = self._run([*options[:1], "--check", *options[1:]], input_text=patch, check=False)
         if checked['returncode']:
@@ -591,9 +655,27 @@ class RepositoryTools:
         if name not in handlers:
             raise ToolError("invalid_arguments", "Unknown or unavailable repository tool.")
         validate_arguments(next(t for t in GIT_TOOLS if t['function']['name'] == name), arguments)
+        local_arguments = dict(arguments)
+        notes = local_arguments.pop('interface_notes', []) if name in EDIT_TOOL_NAMES else []
         try:
             if name == 'run_check' and check_timeout is not None:
-                return self.run_check(**arguments, timeout_seconds=check_timeout)
-            return handlers[name](**arguments)
+                return self.run_check(**local_arguments, timeout_seconds=check_timeout)
+            result = handlers[name](**local_arguments)
         except (OSError, UnicodeError) as error:
             raise ToolError('local_operation_failed', 'Local operation failed. Check file encoding, paths and permissions; inspect the files before retrying an edit.') from error
+
+        if name in EDIT_TOOL_NAMES and result.get('applied'):
+            if self.interface_memory_enabled:
+                try:
+                    memory=self.interface_map.after_edit(result.get('files',[]),notes)
+                    result['interface_memory']=memory
+                    result.setdefault('warnings',[]).extend(memory.get('warnings',[]))
+                except Exception:
+                    # The edit already happened; failure of derived metadata
+                    # must never trigger a duplicate edit attempt.
+                    result.setdefault('warnings',[]).append(
+                        'Code changed, but interface memory refresh failed. Inspect current source before using old notes.')
+                    result['interface_memory']={'updated':False}
+            elif notes:
+                result.setdefault('warnings',[]).append('Interface memory is disabled; notes were not saved.')
+        return result

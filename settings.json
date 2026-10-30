@@ -4,19 +4,47 @@
     "max_retries": 0
   },
   "generation": {
-    "max_completion_tokens": 4096,
+    "max_completion_tokens": 2048,
     "temperature": 1.0,
     "top_p": 0.95
   },
   "execution": {
-    "max_api_calls_per_turn": 16,
-    "max_steps_per_agent": 8,
-    "reserved_director_calls": 2,
-    "final_answer_target_tokens": 2800,
-    "max_delegated_task_characters": 20000
+    "max_api_calls_per_turn": 100,
+    "max_steps_per_agent": 100,
+    "final_answer_target_tokens": 512,
+    "length_recovery_attempts": 1,
+    "iterations_per_task": 1,
+    "stop_after_confirmation": false,
+    "compact_tool_history": true,
+    "compaction_threshold_characters": 12000,
+    "recovery_max_completion_tokens": 2048,
+    "project_map_enabled": true,
+    "project_map_context_characters": 2500,
+    "research_calls_before_action": 4,
+    "implementation_calls_reserve": 4,
+    "max_output_tokens_per_turn": 20000,
+    "final_output_reserve_tokens": 512
   },
   "roles": {
-    "director": { "max_delegations": 2 },
-    "worker": { "max_delegations": 0 }
+    "director": {
+      "max_delegations": 0
+    }
+  },
+  "tools": {
+    "editing_enabled": true,
+    "allow_git_mutations": false,
+    "git_history_enabled": false
+  },
+  "checks": {
+    "python_tests": [
+      "{python}",
+      "-B",
+      "-m",
+      "unittest",
+      "discover",
+      "-s",
+      "tests",
+      "-v"
+    ]
   }
 }

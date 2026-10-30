@@ -31,7 +31,7 @@ FILE_TOOLS = [
                               "description": "Recursive levels to show; default 3."},
                 "max_entries": {"type": "integer", "minimum": 1, "maximum": 1000,
                                 "description": "Maximum files and directories; default 400."}}, ["path"]),
-    definition("read_file", "Read a UTF-8 file with 1-based line numbers and inclusive ranges. Defaults to 200 lines; returns whole lines within 20,000 characters and a continuation line. A single oversized line returns line_too_long; use search for a snippet.",
+    definition("read_file", "Read a UTF-8 file with 1-based line numbers and inclusive ranges. Defaults to 200 lines; returns whole lines within 20,000 characters and a continuation line. Returns content_sha256 for optional guarded replace_text. A single oversized line returns line_too_long; use search for a snippet.",
                {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1},
                 "end_line": {"type": "integer", "minimum": 1}}, ["path"]),
     definition("search_text", "Find literal text in accessible UTF-8 files up to 2 MB. Returns path:line snippets and a cursor over a saved snapshot (valid for up to 5 minutes, subject to eviction). Restart without a cursor for fresh results.",
@@ -55,46 +55,6 @@ FILE_TOOLS = [
                                 "description": "Maximum matching lines on this page; default 100."},
                 "cursor": {"type": "string", "description": "next_cursor from the same search. Continues its saved snapshot; rerun without cursor if expired."}}, ["pattern"]),
 ]
-DELEGATE_TOOL = definition("delegate_task", "Start a worker with an isolated context. mode=research (default) reads/analyzes; mode=implementation edits and checks in a private Git worktree when enabled. Supply goal, scope, current interfaces, requirements and deliverable. Implementation workers need an initial commit; their changes are NOT automatically transferred. Budget sums must fit the allocatable pool. Collect results with wait_tasks; review/apply implementation changes separately.",
-                           {"task": {"type": "string"},
-                            "mode": {"type": "string", "enum": ["research", "implementation"],
-                                     "description": "research for investigation/review; implementation for isolated coding."},
-                            "max_calls": {"type": "integer", "minimum": 1,
-                                          "description": "Maximum model requests, including the final report; not individual tool executions."},
-                            "report_target_tokens": {"type": "integer", "minimum": 100,
-                                                     "description": "Target visible report length; not a hard token limit."}},
-                           ["task", "max_calls", "report_target_tokens"])
-WORKER_CHANGE_TOOLS = [
-    definition('review_task_changes', 'Review a finished implementation worker: changed paths, bounded diff and transfer fingerprint. Use path to inspect one changed file if truncated. This does not apply changes.',
-               {'task_id': {'type': 'string'}, 'path': {'type': 'string'}}, ['task_id']),
-    definition('apply_task_changes', 'Transfer a reviewed finished worker patch into the director workspace. Call alone using the review fingerprint. Refuses files changed since the worker snapshot and never overwrites a conflict. Then run director checks before committing; worker checks do not verify the combined result.',
-               {'task_id': {'type': 'string'}, 'fingerprint': {'type': 'string'}}, ['task_id', 'fingerprint']),
-]
-COMPARISON_TOOLS = [
-    definition('start_comparison_round', 'Start exactly two independent implementation workers with the SAME task and baseline. Call alone. Requires a clean committed director workspace and enough shared budget for both workers plus the director reserve. Collect both with wait_tasks and review both patches before choosing; director does not edit files in this mode.',
-               {'task': {'type': 'string', 'minLength': 1},
-                'max_calls_per_worker': {'type': 'integer', 'minimum': 2},
-                'report_target_tokens': {'type': 'integer', 'minimum': 100}},
-               ['task', 'max_calls_per_worker', 'report_target_tokens']),
-    definition('promote_candidate', 'Choose ONE complete worker result from the active comparison round. Call alone after both workers finish and both available patches are reviewed. Transfers its frozen patch, runs every configured director check and creates a local commit. The accepted commit becomes the baseline of the next round. Failed checks/commit trigger rollback of owned changes; inspect promoted/rolled_back and report failures. Never combines the two variants or pushes.',
-               {'round_id': {'type': 'string'}, 'task_id': {'type': 'string'},
-                'fingerprint': {'type': 'string'}, 'message': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
-                'rationale': {'type': 'string', 'minLength': 1, 'maxLength': 2000}},
-               ['round_id', 'task_id', 'fingerprint', 'message', 'rationale']),
-    definition('reject_comparison_round', 'Reject both finished alternatives and keep the current accepted baseline. Call alone with a concrete reason; then start a narrower or corrected round if budget permits. Does not delete worker worktrees.',
-               {'round_id': {'type': 'string'}, 'reason': {'type': 'string', 'minLength': 1, 'maxLength': 2000}},
-               ['round_id', 'reason']),
-]
-WAIT_TASKS_TOOL = definition(
-    "wait_tasks",
-    "Wait for worker results. Omit task_ids to select all workers in this turn. Returns execution and result status, including available drafts. A timeout does not cancel workers.",
-    {"task_ids": {"type": "array", "items": {"type": "string"},
-                  "description": "Optional delegated task IDs to wait for."},
-     "return_when": {"type": "string", "enum": ["any", "all"],
-                     "description": "Return after any selected task finishes or after all finish; default all."},
-     "timeout_seconds": {"type": "number", "minimum": 1, "maximum": 120,
-                         "description": "Local wait timeout; default 60 seconds. This does not cancel workers."}},
-    [])
 
 
 class ProjectTools:
@@ -189,12 +149,16 @@ class ProjectTools:
         if not target.is_file() or target.stat().st_size > 2_000_000:
             raise ToolError("invalid_arguments", "Expected a text file no larger than 2 MB.")
         try:
-            text = target.read_text(encoding="utf-8")
+            raw = target.read_bytes()
+            text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         except UnicodeDecodeError as error:
             raise ToolError('unsupported_encoding', 'read_file supports UTF-8 text. Use a UTF-8 source file.') from error
         if "\x00" in text:
             raise ToolError("invalid_arguments", "Binary files are not supported.")
         lines = text.splitlines()
+        if start_line > max(1, len(lines)):
+            raise ToolError('invalid_range', 'start_line is beyond the end of the file.',
+                            total_lines=len(lines), requested_start_line=start_line)
         if end_line is None:
             end = min(
                 start_line + DEFAULT_LINES_PER_READ - 1,
@@ -217,9 +181,19 @@ class ProjectTools:
         requested_end = min(end_line if end_line is not None else len(lines), len(lines))
         next_line = last_line + 1 if last_line is not None and last_line < requested_end else None
         return {"path": path, "total_lines": len(lines), "content": "\n".join(rendered),
+                "content_sha256": hashlib.sha256(raw).hexdigest(),
                 "returned_start_line": start_line if rendered else None,
                 "returned_end_line": last_line, "next_start_line": next_line,
                 "truncated": next_line is not None}
+
+    @staticmethod
+    def _match_snippet(line, position, limit=300):
+        if len(line) <= limit:
+            return line
+        start = max(0, position - 60)
+        start = min(start, max(0, len(line) - (limit - 2)))
+        end = min(len(line), start + limit - 2)
+        return ('…' if start else '') + line[start:end] + ('…' if end < len(line) else '')
 
     @staticmethod
     def matches_glob(path, pattern):
@@ -385,10 +359,20 @@ class ProjectTools:
             for line_number, line in enumerate(lines, 1):
                 try:
                     if regex:
-                        matched = compiled_pattern.search(line, timeout=0.05) is not None
+                        match = compiled_pattern.search(line, timeout=0.05)
+                        match_start = match.start() if match else -1
                     else:
                         haystack = line if case_sensitive else line.casefold()
-                        matched = needle in haystack
+                        match_start = haystack.find(needle)
+                        if match_start >= 0 and not case_sensitive:
+                            # Case folding may expand characters (ß -> ss).
+                            folded_length = 0
+                            for original_index, character in enumerate(line):
+                                folded_length += len(character.casefold())
+                                if folded_length > match_start:
+                                    match_start = original_index
+                                    break
+                    matched = match_start >= 0
                 except TimeoutError as error:
                     raise ToolError("invalid_arguments", "Regular expression search timed out; simplify the pattern.") from error
                 if not matched:
@@ -402,9 +386,7 @@ class ProjectTools:
                     collection_truncated = True
                     continue
                 if context_lines == 0:
-                    snippet = line.strip()
-                    if len(snippet) > 300:
-                        snippet = snippet[:299] + "…"
+                    snippet = self._match_snippet(line, match_start)
                     block = f"{relative_text}:{line_number}:{snippet}"
                 else:
                     start = max(1, line_number - context_lines)
@@ -412,9 +394,8 @@ class ProjectTools:
                     rendered_lines = [f"{relative_text}:{line_number}"]
                     for number in range(start, end + 1):
                         marker = ">" if number == line_number else " "
-                        snippet = lines[number - 1]
-                        if len(snippet) > 300:
-                            snippet = snippet[:299] + "…"
+                        snippet = self._match_snippet(lines[number - 1],
+                                                      match_start if number == line_number else 0)
                         rendered_lines.append(f"{marker} {number}: {snippet}")
                     block = "\n".join(rendered_lines)
                 if stored_characters + len(block) > 500000:
