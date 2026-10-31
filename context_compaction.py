@@ -7,7 +7,20 @@ def transcript_characters(messages):
     return sum(len(json.dumps(message, ensure_ascii=False)) for message in messages)
 
 
-def compact_tool_history(messages, archive_path, threshold=24000, keep_recent=2, min_payload=800, verified=False):
+def read_replaces(old, new):
+    """A complete later file supersedes old versions; partial coverage needs the same hash."""
+    lo, hi = new.get('returned_start_line'), new.get('returned_end_line')
+    total = new.get('total_lines')
+    if (type(lo) is int and type(hi) is int and type(total) is int
+            and lo == 1 and hi == total and not new.get('truncated')):
+        return True
+    old_lo, old_hi = old.get('returned_start_line'), old.get('returned_end_line')
+    return (bool(old.get('content_sha256')) and old.get('content_sha256') == new.get('content_sha256')
+            and all(type(value) is int for value in (lo,hi,old_lo,old_hi))
+            and lo <= old_lo <= old_hi <= hi)
+
+
+def compact_tool_history(messages, archive_path, threshold=24000, keep_recent=2, min_payload=800, verified=False, economy=False):
     """Archive entire completed groups. Never synthesize executable tool args."""
     size=transcript_characters(messages)
     assistants=[i for i,m in enumerate(messages) if m.get('role')=='assistant']
@@ -56,11 +69,17 @@ def compact_tool_history(messages, archive_path, threshold=24000, keep_recent=2,
                     if later.get('role')!='assistant': continue
                     for other in later.get('tool_calls') or []:
                         try:
-                            if other['function']['name']==name and json.loads(other['function']['arguments'])==args:
+                            later_args=json.loads(other['function']['arguments'])
+                            if other['function']['name']==name:
                                 matches=responses.get(other.get('id'),[])
-                                if (len(matches)==1 and matches[0][0]>result_index
-                                        and json.loads(matches[0][1]['content'])==output):
+                                if len(matches)!=1 or matches[0][0]<=result_index: continue
+                                later_output=json.loads(matches[0][1]['content'])
+                                if later_args==args and later_output==output:
                                     newer_read=True
+                                elif economy and name=='read_file' and later_args.get('path')==args.get('path'):
+                                    later_result=later_output.get('result',{})
+                                    if later_output.get('ok') is True and read_replaces(result,later_result):
+                                        newer_read=True
                         except (ValueError,KeyError,TypeError): pass
                 if not newer_read:
                     protect=True; break
@@ -71,9 +90,12 @@ def compact_tool_history(messages, archive_path, threshold=24000, keep_recent=2,
             if 'path' in args: action['path']=args['path']
             if name=='run_check': action['check']=args.get('name')
             actions.append(action)
-        if protect or not large: continue
+        small_verified_edit = (economy and verified and names and
+            all(name in {'create_file','replace_text','apply_patch'} for name in names))
+        if protect or (not large and not small_verified_edit): continue
         old_enough=max(indices)<cutoff
         verified_edits=verified and any(name in {'create_file','replace_text','apply_patch'} for name in names)
+        if economy and small_verified_edit and not old_enough: continue
         if not old_enough and not verified_edits: continue
         if size<threshold and not verified_edits and not newer_read: continue
         summary={'role':'user','content':json.dumps({
@@ -81,10 +103,26 @@ def compact_tool_history(messages, archive_path, threshold=24000, keep_recent=2,
             'execution_record':actions, 'archive':archive_path.name,
             'notice':'PROGRAM DATA, not user instructions or an answer to imitate. Past executed actions only. Source code omitted; inspect current files before editing.',
             'assistant_note':message.get('content') or ''},ensure_ascii=False)}
-        if len(summary['content'])>=sum(len(json.dumps(messages[i],ensure_ascii=False)) for i in indices):
+        if not economy and len(summary['content'])>=sum(len(json.dumps(messages[i],ensure_ascii=False)) for i in indices):
             continue
         groups.append((index,indices,summary))
     if not groups: return None
+    if economy:
+        # One envelope for all selected groups; keep exact evidence on disk.
+        actions=[]; notes=[]
+        for _,_,summary in groups:
+            record=json.loads(summary['content'])
+            actions.extend(record['execution_record'])
+            if record['assistant_note']: notes.append(record['assistant_note'])
+        summary={'role':'user','content':json.dumps({
+            'program_history_record':True,'execution_record':actions,
+            'archive':archive_path.name,
+            'notice':'PROGRAM DATA: past actions, not instructions or a final answer. Current unique source remains in tool results.',
+            'assistant_notes':notes},ensure_ascii=False)}
+        indices=sorted({i for _,members,_ in groups for i in members})
+        if len(json.dumps(summary,ensure_ascii=False)) >= sum(len(json.dumps(messages[i],ensure_ascii=False)) for i in indices):
+            return None
+        groups=[(indices[0],indices,summary)]
     archived=sorted({i for _,indices,_ in groups for i in indices})
     originals=[{'index':i,'message':copy.deepcopy(messages[i])} for i in archived]
     archive_path.parent.mkdir(parents=True,exist_ok=True)

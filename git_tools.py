@@ -551,6 +551,40 @@ class RepositoryTools:
         relative = self.policy.relative(path).as_posix()
         return self._edit_result(relative, '', content, created=True, warnings=warnings)
 
+    @staticmethod
+    def _replacement_hint(text, old_text, new_text):
+        present = bool(new_text) and new_text in text
+        index = text.find(new_text) if present else -1
+        if index < 0:
+            anchors = [line for line in old_text.splitlines() if len(line.strip()) >= 8]
+            for anchor in anchors[:5]:
+                index = text.find(anchor)
+                if index >= 0: break
+            if index < 0 and anchors:
+                # Bounded hint only. Similarity never authorizes a write.
+                needle = max(anchors[:5], key=len).strip()[:240]
+                candidates = text.splitlines()[:2000]
+                best, score = None, 0.6
+                for number, line in enumerate(candidates):
+                    candidate = line.strip()[:240]
+                    matcher = difflib.SequenceMatcher(None, needle, candidate, autojunk=False)
+                    if matcher.quick_ratio() < score: continue
+                    ratio = matcher.ratio()
+                    if ratio > score: best, score = number, ratio
+                if best is not None:
+                    index = sum(len(line) for line in text.splitlines(keepends=True)[:best])
+        details = {'new_text_present': present}
+        if index >= 0:
+            line_number = text[:index].count('\n') + 1
+            lines = text.splitlines()
+            start = max(1, line_number - 2)
+            end = min(len(lines), start + 6)
+            details['diagnostic'] = ('Current source candidate only; verify the intended location before editing.\n' +
+                '\n'.join(f'{i+1}: ' + lines[i][:180] + (' ...' if len(lines[i])>180 else '')
+                          for i in range(start-1,end)))[:1400]
+            details.update(suggested_start_line=start, suggested_end_line=end)
+        return details
+
     def replace_text(self, path, old_text, new_text, expected_sha256=None):
         if (not isinstance(old_text, str) or not old_text
                 or not isinstance(new_text, str)
@@ -583,7 +617,14 @@ class RepositoryTools:
             new_text = new_text.replace("\r\n", "\n").replace("\n", "\r\n")
         first = text.find(old_text)
         if first < 0:
-            raise ToolError("text_not_found", "old_text does not match the current file. Use a focused read and copy the exact fragment.")
+            hint = self._replacement_hint(text, old_text, new_text)
+            message = ('old_text does not match the current file. No write occurred. ' +
+                       ('new_text is already present in the file; this may be a repeated edit, '
+                        'but presence alone does not prove the intended location is correct. '
+                        if hint['new_text_present'] else '') +
+                       'Use the current candidate or a focused read and copy the exact fragment; never retry unchanged old_text.')
+            raise ToolError('text_not_found', message,
+                            content_sha256=hashlib.sha256(original).hexdigest(), **hint)
         if text.find(old_text, first + 1) >= 0:
             raise ToolError("text_not_unique", "old_text matches more than once. Include more surrounding context.")
         updated = (text[:first] + new_text + text[first + len(old_text):]).encode("utf-8")

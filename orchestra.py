@@ -47,6 +47,30 @@ def requires_implementation(messages):
     return bool(re.search(r'\b(?:implement|fix|create|build|add|repair)\b|исправ|почин|сдела|добав|реализ|напиши', text, re.I))
 
 
+def complete_tool_prefix(drafts, definitions, used_ids=()):
+    """Validate in stream order; never execute beyond the first incomplete call."""
+    prefix=[]
+    seen=set(used_ids)
+    # Git mutations require a complete standalone response, never salvage them.
+    if any(isinstance(c,dict) and isinstance(c.get('function'),dict)
+           and c['function'].get('name') in {'git_create_branch','create_commit'} for c in drafts):
+        return prefix
+    for call in drafts:
+        try:
+            if not isinstance(call,dict) or call.get('type') != 'function': break
+            key=call.get('id')
+            if not isinstance(key,str) or not key or key in seen: break
+            function=call['function']; name=function['name']
+            if name not in definitions: break
+            args=parse_arguments(function['arguments'])
+            validate_arguments(definitions[name],args)
+        except (KeyError, TypeError, ValueError):
+            break
+        seen.add(key)
+        prefix.append(copy.deepcopy(call))
+    return prefix
+
+
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -91,6 +115,9 @@ class AgentDashboard:
         self.live = None
         self.states = {}
         self.title = "Orchestra"
+        self.output_used = 0
+        self.output_limit = 20000
+        self.output_estimated = False
 
     @staticmethod
     def clean(value, limit=240):
@@ -155,6 +182,7 @@ class AgentDashboard:
         table.add_column("Activity")
         table.add_column("Time", justify="right", no_wrap=True)
         table.add_column("Stream", justify="right", no_wrap=True)
+        table.add_column("Tokens", justify="right", no_wrap=True)
         table.add_column("Spent", justify="right", no_wrap=True,
                          style="bright_green")
         total_cost = 0.0
@@ -176,15 +204,28 @@ class AgentDashboard:
                 total_cost += cost
                 known_costs = True
             table.add_row(prefix + label, f"[{status_style}]{status}[/{status_style}]",
-                          Text(state["activity"]), f"{elapsed:.1f}s", chunks, cost_text)
+                          Text(state["activity"]), f"{elapsed:.1f}s", chunks, "", cost_text)
         if self.states:
             table.add_section()
-            table.add_row("TOTAL", "", "completed API calls", "", "",
+            def compact_tokens(value):
+                return (f"{value / 1000:.1f}".rstrip('0').rstrip('.') + 'к') if value >= 1000 else str(value)
+            tokens = f"{compact_tokens(self.output_used)}/{compact_tokens(self.output_limit)}"
+            table.add_row("TOTAL", "", "completed API calls", "", "", tokens,
                           f"${total_cost:.5f}" if known_costs else "â€”")
         return table
 
-    def start(self, turn_id, topic):
+    def update_output_budget(self, used, limit, estimated=False):
+        self.output_used = used
+        self.output_limit = limit
+        self.output_estimated = estimated
+        if self.live:
+            self.live.update(self.render(), refresh=True)
+
+    def start(self, turn_id, topic, output_limit=20000):
         self.states = {}
+        self.output_used = 0
+        self.output_limit = output_limit
+        self.output_estimated = False
         self.title = f"Orchestra Â· {topic}"
         self.live = Live(self.render(), console=self.console, refresh_per_second=4,
                          transient=False)
@@ -647,7 +688,7 @@ class Orchestra:
                 raise OutputLimitError(
                     f'Output token limit reached; max_completion_tokens={output_limit}; '
                     f'visible answer={sum(map(len, content))} characters; tool calls={len(calls)}. '
-                    'No tools from this response were executed.', draft=''.join(content) or None, tool_drafts=list(calls.values()))
+                    'No tools executed yet; the runtime will validate any complete prefix.', draft=''.join(content) or None, tool_drafts=[calls[i] for i in sorted(calls)])
             partial = False
             if finish not in {"stop", "tool_calls"}:
                 reason = ('Output token limit reached' if finish == 'length' else
@@ -684,6 +725,12 @@ class Orchestra:
             measured = usage.get('completion_tokens') if isinstance(usage, dict) else None
             charged = measured if type(measured) is int and measured >= 0 else output_limit
             usage_entry['output_budget_tokens'] = usage_entry.get('output_budget_tokens', 0) + charged
+            if type(measured) is not int or measured < 0:
+                usage_entry['output_budget_estimated'] = True
+            self.dashboard.update_output_budget(
+                sum(entry.get('output_budget_tokens', entry.get('completion_tokens',0)) for entry in turn_usage.values()),
+                self.settings['execution'].get('max_output_tokens_per_turn',20000),
+                estimated=any(entry.get('output_budget_estimated',False) for entry in turn_usage.values()))
             current_cost = self.estimated_cost(usage_entry) if usage is not None else None
             self.dashboard.update(label, depth, activity, received,
                                   "failed" if error_type else "running",
@@ -987,7 +1034,8 @@ class Orchestra:
                 try:
                     stats = compact_tool_history(messages, archive,
                         threshold=self.settings['execution'].get('compaction_threshold_characters', 24000),
-                        verified=result('')['verification']['status']=='passed')
+                        verified=result('')['verification']['status']=='passed',
+                        economy=self.settings['execution'].get('context_economy_enabled',False))
                     if stats:
                         trace.event('context_compacted', task_id=task_id,
                                     archive=str(archive.relative_to(trace.directory)), **stats)
@@ -1025,6 +1073,9 @@ class Orchestra:
                     resource_status += '\nProject map unavailable; inspect current source definitions directly.'
                     trace.event('project_map_unavailable',task_id=task_id)
 
+            salvaged_length = False
+            length_stop_after_tools = False
+            length_notice = None
             budget['calls'] -= 1
             self.dashboard.action(label, f'Model request {step + 1}/{call_limit}; '
                                   f'{budget["calls"]} calls left' + ('; final report' if force_final else ''))
@@ -1048,46 +1099,50 @@ class Orchestra:
                 return outcome
             except OutputLimitError as error:
                 saved_draft = error.draft or saved_draft
-                can_retry = (recovery_attempts < self.settings['execution'].get('length_recovery_attempts', 1)
-                             and budget['calls'] > 0 and step + 1 < call_limit)
+                used_after_error = sum(entry.get('output_budget_tokens', entry.get('completion_tokens', 0))
+                                       for entry in turn_usage.values())
+                can_retry = (not force_final and budget['calls'] > 0 and step + 1 < call_limit
+                             and used_after_error < output_ceiling)
+                used_ids = {c.get('id') for m in messages for c in m.get('tool_calls',[])}
+                prefix = complete_tool_prefix(error.tool_drafts, definitions, used_ids) if not force_final else []
+                length_notice = (
+                    'The previous response exceeded its output limit. Only calls with explicit tool results '
+                    'in this conversation were executed; the remaining tail was discarded. Do not repeat '
+                    'successful calls. Respect failed results before using dependent code. '
+                    'Do not repeat exploration or a long plan. Make ONE small complete edit, around 800 '
+                    'output tokens or less. For a large new file create a valid minimal version, then extend '
+                    'it with focused edits. Never resume raw JSON mid-string. If tools are unavailable, '
+                    'report actual changes, checks and gaps. Never claim discarded edits occurred.')
                 if can_retry:
                     recovery_attempts += 1
                     recovering_length = True
                     thinking_disabled_for_turn = True
-                    messages.append({'role':'system', 'content':
-                        'The previous response exceeded its output limit. None of its tool calls executed. '
-                        'Do not repeat exploration or a long plan. Use existing evidence to make ONE small '
-                        'complete edit. Keep each code batch around 1500 output tokens or less. '
-                        'For a large new file, first create a valid minimal version, then extend it '
-                        'with focused replace_text calls in later responses. Never resume raw JSON '
-                        'mid-string: regenerate complete tool arguments. If tools are unavailable, '
-                        'produce a concise report of actual results and gaps. Do not claim discarded edits occurred.'})
-                    if error.tool_drafts:
-                        descriptions = []
-                        for draft in error.tool_drafts[:3]:
-                            function = draft.get('function', {})
-                            args = function.get('arguments', '')
-                            descriptions.append({'tool':function.get('name'),
-                                'unexecuted_argument_excerpt':args[:800] + (' ... ' + args[-400:] if len(args)>800 else '')})
-                        messages.append({'role':'system','content':
-                            'Unexecuted draft fragments for reference only; not proof of changes. '
-                            + json.dumps(descriptions,ensure_ascii=False)})
                     trace.event('output_limit_recovery_started', task_id=task_id,
                                 attempt=recovery_attempts, calls_remaining=budget['calls'],
                                 thinking_disabled_for_turn=True)
-                    self.dashboard.action(label, 'Output limit: retrying one small step within the remaining call budget.')
+                if prefix:
+                    salvaged_length = True
+                    length_stop_after_tools = not can_retry
+                    message = {'role':'assistant','content':None,'tool_calls':prefix}
+                    trace.event('output_limit_prefix_selected', task_id=task_id,
+                                selected=len(prefix), discarded=len(error.tool_drafts)-len(prefix))
+                    self.dashboard.action(label, f'Output limit: executing {len(prefix)} complete validated calls; unfinished tail discarded.')
+                elif can_retry:
+                    messages.append({'role':'system','content':length_notice})
+                    self.dashboard.action(label, 'Output limit: retrying one small step within the remaining budget.')
                     continue
-                explanation = ('Stopped after the output token limit; no incomplete tool calls were executed. '
-                               'Existing file changes remain saved. Further work requires another request.')
-                answer = (saved_draft + '\n\n' if saved_draft else '') + explanation
-                messages.append({'role':'assistant','content':answer})
-                trace.event('output_limit_recovery_exhausted', task_id=task_id,
-                            attempts=recovery_attempts, calls_remaining=budget['calls'])
-                self.dashboard.action(label, explanation, failed=True)
-                outcome = result(answer, partial=True)
-                outcome['stop_reason'] = 'output_limit'
-                return outcome
-            if recovering_length:
+                else:
+                    explanation = ('Stopped at the remaining call/output budget or final-report boundary after an output limit. '
+                                   'No incomplete tool calls were executed. Existing file changes remain saved.')
+                    answer = (saved_draft + '\n\n' if saved_draft else '') + explanation
+                    messages.append({'role':'assistant','content':answer})
+                    trace.event('output_limit_recovery_exhausted', task_id=task_id,
+                                attempts=recovery_attempts, calls_remaining=budget['calls'])
+                    self.dashboard.action(label, explanation, failed=True)
+                    outcome = result(answer, partial=True)
+                    outcome['stop_reason'] = 'output_limit'
+                    return outcome
+            if recovering_length and not salvaged_length:
                 recovering_length = False
                 trace.error_message = None
                 trace.event('output_limit_recovery_succeeded', task_id=task_id)
@@ -1180,6 +1235,7 @@ class Orchestra:
             exclusive = len(calls) > 1 and bool(names & {'git_create_branch', 'create_commit'})
             # Execute in response order. A later read sees earlier edits; checks
             # use the revision at that point. No concurrent writers or Git changes.
+            prefix_failed = False
             for call in calls:
                 name = call['function']['name']
                 started = time.monotonic()
@@ -1188,6 +1244,8 @@ class Orchestra:
                 summary = error_code = None
                 self.dashboard.update(label, trace.tasks[task_id]['depth'], f'tool Â· {name}')
                 try:
+                    if salvaged_length and prefix_failed:
+                        raise ToolError('skipped_after_prefix_failure', 'Not executed: an earlier call in the recovered prefix failed. Inspect its result before retrying dependent actions.')
                     if force_final or name not in definitions:
                         raise ToolError('tool_unavailable', 'This tool is unavailable. Use the exposed tools or finish the report.')
                     if exclusive:
@@ -1240,6 +1298,7 @@ class Orchestra:
                 duration = time.monotonic() - started
                 self.dashboard.tool_finished(label, name, args, output, duration)
                 if not output['ok']:
+                    prefix_failed = True
                     summary = {'message': output['message']}
                     for field in ('diagnostic', 'output', 'truncated', 'omitted_bytes'):
                         if field in output:
@@ -1250,6 +1309,17 @@ class Orchestra:
                                   duration, output['ok'], summary, error_code)
                 messages.append({'role': 'tool', 'tool_call_id': call['id'],
                                  'content': json.dumps(output, ensure_ascii=False)})
+            if salvaged_length:
+                trace.error_message = None
+                messages.append({'role':'system','content':length_notice})
+                trace.event('output_limit_prefix_settled',task_id=task_id,
+                            modified_files=sorted(changed),verification=result('')['verification'])
+                if length_stop_after_tools:
+                    outcome=result((saved_draft + '\n' if saved_draft else '') +
+                        'Output/call budget boundary reached. Complete calls were processed; unfinished tail discarded. '
+                        'Saved changes: ' + ', '.join(sorted(changed)),partial=True)
+                    outcome['stop_reason']='output_limit'
+                    return outcome
         return result('Call budget exhausted. Inspect saved changes and verification results before continuing.', partial=True)
 
 
@@ -1290,6 +1360,8 @@ def validate_settings(settings):
         value = settings['execution'].get(key, 4)
         if type(value) is not int or value < 1:
             raise ValueError(f'{key} must be a positive integer.')
+    if type(settings['execution'].get('context_economy_enabled',False)) is not bool:
+        raise ValueError('context_economy_enabled must be boolean.')
     if type(settings['execution'].get('compact_tool_history', True)) is not bool:
         raise ValueError('compact_tool_history must be boolean.')
     threshold = settings['execution'].get('compaction_threshold_characters', 24000)
@@ -1301,9 +1373,6 @@ def validate_settings(settings):
     recovery_limit = settings['execution'].get('recovery_max_completion_tokens', 8192)
     if type(recovery_limit) is not int or not 1 <= recovery_limit <= 32768:
         raise ValueError('recovery_max_completion_tokens must be an integer from 1 to 32768.')
-    attempts = settings['execution'].get('length_recovery_attempts', 1)
-    if type(attempts) is not int or not 0 <= attempts <= 3:
-        raise ValueError('length_recovery_attempts must be an integer from 0 to 3.')
     options = settings.get('tools', {})
     if (not isinstance(options, dict) or set(options) - {'editing_enabled', 'allow_git_mutations', 'git_history_enabled'}
             or any(type(value) is not bool for value in options.values())):
@@ -1379,7 +1448,8 @@ async def main():
         turn_usage = {}
         trace = TurnTrace(app.logs_path, text, app.files.root)
         root_task_id = trace.start_task("director", text)
-        app.dashboard.start(trace.turn_id, trace.topic)
+        app.dashboard.start(trace.turn_id, trace.topic,
+                            output_limit=app.settings['execution'].get('max_output_tokens_per_turn',20000))
         turn_status = "failed"
         turn_error = None
         try:

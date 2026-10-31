@@ -41,3 +41,31 @@ class ReplacementTests(unittest.TestCase):
                 self.repo.replace_text('a.txt','old','new')
         self.assertEqual(p.read_bytes(),b'old\n')
         self.assertEqual([p.name for p in self.root.iterdir()],['a.txt'])
+
+    def test_repeat_edit_reports_existing_new_text_without_writing(self):
+        p=self.root/'a.txt'; p.write_bytes(b'header\r\nvalue = 2\r\nfooter\r\n')
+        before=p.read_bytes()
+        with self.assertRaises(ToolError) as error:
+            self.repo.replace_text('a.txt','value = 1','value = 2')
+        self.assertEqual(error.exception.code,'text_not_found')
+        self.assertTrue(error.exception.details['new_text_present'])
+        self.assertIn('value = 2',error.exception.details['diagnostic'])
+        self.assertIn('presence alone does not prove',str(error.exception))
+        self.assertEqual(p.read_bytes(),before)
+
+    def test_nearby_current_fragment_is_a_hint_not_a_fuzzy_edit(self):
+        p=self.root/'a.txt';p.write_text('head\n    player_speed = 7\ntail\n',encoding='utf-8')
+        before=p.read_bytes()
+        with self.assertRaises(ToolError) as error:
+            self.repo.replace_text('a.txt','    player_speed = 6','    player_speed = 8')
+        self.assertFalse(error.exception.details['new_text_present'])
+        self.assertIn('player_speed = 7',error.exception.details['diagnostic'])
+        self.assertLessEqual(len(error.exception.details['diagnostic']),1400)
+        self.assertEqual(p.read_bytes(),before)
+
+    def test_deletion_and_unrelated_missing_fragment_do_not_claim_already_applied(self):
+        p=self.root/'a.txt';p.write_text('nothing related here\n',encoding='utf-8')
+        with self.assertRaises(ToolError) as error:
+            self.repo.replace_text('a.txt','missing','')
+        self.assertFalse(error.exception.details['new_text_present'])
+        self.assertNotIn('diagnostic',error.exception.details)

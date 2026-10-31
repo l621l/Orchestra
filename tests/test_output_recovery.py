@@ -39,21 +39,40 @@ class OutputRecovery(unittest.IsolatedAsyncioTestCase):
         result, outputs, pool = await self.run_script([
             self.response(self.call('create_file', path='value.txt', content='correct')),
             OutputLimitError('length', draft='Some work is saved.'),
-            OutputLimitError('length')], budget=8)
+            OutputLimitError('length')], budget=3)
         self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['stop_reason'], 'output_limit')
         self.assertIn('Some work is saved.', result['answer'])
         self.assertEqual((self.root/'value.txt').read_text(), 'correct')
         self.assertEqual(self.app.request.call_count, 3)
-        self.assertEqual(pool['calls'], 5)
+        self.assertEqual(pool['calls'], 0)
 
-    async def test_no_budget_or_disabled_retry_returns_partial(self):
-        for attempts, budget in [(1,1),(0,8)]:
-            self.settings['execution']['length_recovery_attempts'] = attempts
-            result, _, pool = await self.run_script([OutputLimitError('length')], budget=budget)
-            self.assertEqual(result['status'], 'partial')
-            self.assertEqual(self.app.request.call_count, 1)
-            self.assertEqual(pool['calls'], budget-1)
+    async def test_no_call_budget_returns_partial(self):
+        result, _, pool = await self.run_script([OutputLimitError('length')], budget=1)
+        self.assertEqual(result['status'], 'partial')
+        self.assertEqual(self.app.request.call_count, 1)
+        self.assertEqual(pool['calls'], 0)
+
+    async def test_two_truncations_do_not_stop_work_with_budget_remaining(self):
+        result, outputs, pool = await self.run_script([
+            OutputLimitError('length'), OutputLimitError('length'),
+            self.response(self.call('create_file',path='value.txt',content='correct')),
+            self.response(self.call('run_check',name='unit')),
+            {'role':'assistant','content':'Fixed and checked'}],budget=8)
+        self.assertEqual(result['status'],'completed')
+        self.assertEqual(pool['calls'],3)
+        self.assertEqual((self.root/'value.txt').read_text(),'correct')
+        self.assertEqual(sum(e['event']=='output_limit_recovery_started' for e in self.trace.events),2)
+
+    async def test_truncation_does_not_bypass_shared_output_budget(self):
+        usage={}
+        async def request(*args,**kwargs):
+            usage['director']={'output_budget_tokens':20000}
+            raise OutputLimitError('length')
+        self.app.request=request
+        result=await self.app.run('director',[],{'calls':100},usage,self.trace,self.task)
+        self.assertEqual(result['status'],'partial')
+        self.assertFalse(any(e['event']=='output_limit_recovery_started' for e in self.trace.events))
 
     async def test_other_protocol_failure_is_not_retried(self):
         with self.assertRaises(ModelResponseError):

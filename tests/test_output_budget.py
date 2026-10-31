@@ -8,6 +8,7 @@ class OutputBudget(unittest.IsolatedAsyncioTestCase):
     response = fixtures.SingleModel.response
 
     async def test_shared_budget_caps_requests_and_reserves_final(self):
+        self.settings['generation']['max_completion_tokens']=2048
         self.settings['execution'].update(max_output_tokens_per_turn=3000,final_output_reserve_tokens=512)
         usage={}
         caps=[]

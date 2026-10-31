@@ -35,6 +35,16 @@ class ConsoleFeedback(unittest.TestCase):
         self.assertIn('text_not_found', output)
         self.assertIn('Read the current fragment.', output)
 
+    def test_output_budget_is_a_compact_total_column(self):
+        self.dashboard.update('director')
+        self.dashboard.update_output_budget(5000,20000)
+        self.dashboard.console.print(self.dashboard.render())
+        output=self.stream.getvalue()
+        self.assertIn('Tokens',output)
+        self.assertIn('5к/20к',output)
+        self.assertNotIn('remaining',output)
+        self.assertIsNone(self.dashboard.render().caption)
+
     def test_provider_error_body_is_not_printed(self):
         error = RuntimeError('secret api key and provider body')
         error.status_code = 401
@@ -66,6 +76,8 @@ class RequestDiagnostics(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Output token limit reached', str(caught.exception))
         self.assertIn(str(self.settings['generation']['max_completion_tokens']), str(caught.exception))
         self.assertEqual(usage['director']['output_budget_tokens'],self.settings['generation']['max_completion_tokens'])
+        self.app.dashboard.update_output_budget.assert_called_with(
+            self.settings['generation']['max_completion_tokens'],20000,estimated=True)
         self.assertIn('visible answer=0', str(caught.exception))
         self.trace.finish('failed', type(caught.exception).__name__)
         summary = json.loads((self.trace.directory/'summary.json').read_text())
