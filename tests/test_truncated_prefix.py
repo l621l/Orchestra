@@ -58,10 +58,10 @@ class TruncatedPrefix(unittest.IsolatedAsyncioTestCase):
         usage={}
         first=self.call('create_file',path='value.txt',content='correct')
         async def request(*args,**kwargs):
-            usage['director']={'output_budget_tokens':20000}
+            usage['worker']={'output_budget_tokens':20000}
             raise OutputLimitError('length',tool_drafts=[first,self.unfinished()])
         self.app.request=AsyncMock(side_effect=request)
-        result=await self.app.run('director',[],{'calls':100},usage,self.trace,self.task)
+        result=await self.app.run('worker',[],{'calls':100},usage,self.trace,self.task)
         self.assertEqual(self.app.request.await_count,1)
         self.assertEqual(result['status'],'partial')
         self.assertEqual(result['modified_files'],['value.txt'])

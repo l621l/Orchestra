@@ -44,30 +44,6 @@ class States(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['completion_confirmed'])
 
 
-    async def test_disabled_mimo_omits_reasoning_without_mutating_history(self):
-        from types import SimpleNamespace
-        self.app.config['roles']['director']['model']='mimo-v2.6-pro'
-        chunk=SimpleNamespace(id='offline',model='mimo-v2.6-pro',usage=None,
-            choices=[SimpleNamespace(finish_reason='stop',delta=SimpleNamespace(
-                content='Report',reasoning_content=None,tool_calls=None))])
-        class Stream:
-            async def __aenter__(self): return self
-            async def __aexit__(self,*args): pass
-            def __aiter__(self):
-                async def generate(): yield chunk
-                return generate()
-        create=AsyncMock(return_value=Stream())
-        self.app.clients['offline']=SimpleNamespace(chat=SimpleNamespace(
-            completions=SimpleNamespace(create=create)))
-        history=[{'role':'assistant','content':'previous','reasoning_content':'old thought'}]
-        await self.app.request('director',history,[],'',{},self.trace,self.task,
-                               thinking_override='disabled')
-        self.assertNotIn('reasoning_content',create.call_args.kwargs['messages'][0])
-        self.assertEqual(history[0]['reasoning_content'],'old thought')
-        event=next(e for e in self.trace.events if e['event']=='context_composition')
-        self.assertEqual(event['reasoning_characters_omitted'],11)
-        self.assertEqual(event['reasoning'],0)
-
 
 class ContextEconomy(unittest.TestCase):
     pair = compact_fixtures.Compaction.pair

@@ -14,7 +14,7 @@ class CompletionGuard(unittest.IsolatedAsyncioTestCase):
         self.app.request = AsyncMock(side_effect=replies)
         messages = [{'role':'user','content':task}]
         pool = {'calls':budget}
-        result = await self.app.run('director', messages, pool, {}, self.trace, self.task)
+        result = await self.app.run('worker', messages, pool, {}, self.trace, self.task)
         return result, pool
 
     async def test_research_only_answer_is_repaired_with_real_edit_and_check(self):
@@ -73,7 +73,7 @@ class CompletionGuard(unittest.IsolatedAsyncioTestCase):
             return next(replies)
         self.app.request=request
         pool={'calls':8}
-        result=await self.app.run('director',[{'role':'user','content':'fix the bug'}],pool,{},self.trace,self.task)
+        result=await self.app.run('worker',[{'role':'user','content':'fix the bug'}],pool,{},self.trace,self.task)
         self.assertFalse(any('IMPLEMENTATION CHECKPOINT' in m for m in snapshots[3]))
         self.assertTrue(any('IMPLEMENTATION CHECKPOINT' in m for m in snapshots[4]))
         self.assertEqual(result['verification']['status'],'passed')
@@ -114,9 +114,9 @@ class CompletionGuard(unittest.IsolatedAsyncioTestCase):
         self.settings['execution']['max_output_tokens_per_turn']=20000
         usage={}
         async def request(*args,**kwargs):
-            usage['director']={'output_budget_tokens':20000}
+            usage['worker']={'output_budget_tokens':20000}
             return self.progress_report()
         self.app.request=request
-        result=await self.app.run('director',[],{'calls':100},usage,self.trace,self.task)
+        result=await self.app.run('worker',[],{'calls':100},usage,self.trace,self.task)
         self.assertEqual(result['stop_reason'],'output_budget')
         self.assertEqual(result['status'],'partial')

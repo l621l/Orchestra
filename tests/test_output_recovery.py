@@ -22,18 +22,9 @@ class OutputRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(pool['calls'], 4)
         self.assertEqual(result['verification']['status'], 'passed')
-        self.assertEqual(self.app.request.call_args_list[1].kwargs['thinking_override'], 'disabled')
-        self.assertEqual(self.app.request.call_args_list[1].kwargs['max_completion_tokens'],self.settings['execution']['recovery_max_completion_tokens'])
-        self.assertTrue(all(call.kwargs['thinking_override'] == 'disabled'
-                            for call in self.app.request.call_args_list[1:]))
+        self.assertEqual(self.app.request.call_args_list[1].kwargs['max_output_tokens'],self.settings['generation']['max_output_tokens'])
         self.assertEqual(sum(e['event']=='output_limit_recovery_started' for e in self.trace.events),1)
         self.assertIsNone(self.trace.error_message)
-
-    async def test_next_user_turn_does_not_inherit_thinking_override(self):
-        await self.run_script([OutputLimitError('length'),
-            {'role':'assistant','content':'Partial report.'}])
-        await self.run_script([{'role':'assistant','content':'New task.'}])
-        self.assertIsNone(self.app.request.call_args.kwargs['thinking_override'])
 
     async def test_repeated_length_stops_and_keeps_existing_files_and_draft(self):
         result, outputs, pool = await self.run_script([
@@ -67,10 +58,10 @@ class OutputRecovery(unittest.IsolatedAsyncioTestCase):
     async def test_truncation_does_not_bypass_shared_output_budget(self):
         usage={}
         async def request(*args,**kwargs):
-            usage['director']={'output_budget_tokens':20000}
+            usage['worker']={'output_budget_tokens':20000}
             raise OutputLimitError('length')
         self.app.request=request
-        result=await self.app.run('director',[],{'calls':100},usage,self.trace,self.task)
+        result=await self.app.run('worker',[],{'calls':100},usage,self.trace,self.task)
         self.assertEqual(result['status'],'partial')
         self.assertFalse(any(e['event']=='output_limit_recovery_started' for e in self.trace.events))
 
@@ -78,30 +69,3 @@ class OutputRecovery(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ModelResponseError):
             await self.run_script([ModelResponseError('content_filter')])
         self.assertEqual(self.app.request.call_count,1)
-
-    async def test_actual_truncated_tool_is_discarded_and_mimo_override_sent(self):
-        self.app.config['roles']['director']['model'] = 'mimo-v2.6-flash'
-        fragment = SimpleNamespace(index=0, id='unfinished', function=SimpleNamespace(
-            name='create_file', arguments='{"path":"bad.txt","content":"unfinished'))
-        chunk = SimpleNamespace(id='offline-id',model='mimo-v2.6-flash',usage=None,
-            choices=[SimpleNamespace(finish_reason='length',delta=SimpleNamespace(
-                content=None,reasoning_content='thinking',tool_calls=[fragment]))])
-        class Stream:
-            async def __aenter__(self): return self
-            async def __aexit__(self,*args): pass
-            def __aiter__(self):
-                async def generate(): yield chunk
-                return generate()
-        create = AsyncMock(return_value=Stream())
-        self.app.clients['offline'] = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-        with self.assertRaises(OutputLimitError):
-            await self.app.request('director',[],self.app.available_tools(),'',{},self.trace,self.task,
-                                   thinking_override='disabled')
-        self.assertEqual(create.call_args.kwargs['extra_body'], {'thinking':{'type':'disabled'}})
-        self.assertFalse((self.root/'bad.txt').exists())
-        archives = list(self.trace.directory.glob('*_truncated.json'))
-        self.assertEqual(len(archives),1)
-        self.assertEqual(json.loads(archives[0].read_text())['tool_calls'][0]['function']['arguments'],fragment.function.arguments)
-        event = next(e for e in self.trace.events if e['event']=='model_request_finished')
-        self.assertEqual(event['finish_reason'], 'length')
-        self.assertEqual(event['request']['thinking_override'], 'disabled')

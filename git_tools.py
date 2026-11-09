@@ -90,12 +90,16 @@ class RepositoryTools:
     CHECK_TIMEOUT = 120
     GIT_TIMEOUT = 20
 
-    def __init__(self, root, policy=None, checks=None):
+    def __init__(self, root, policy=None, checks=None, git_enabled=True):
         self.policy = policy or WorkspacePolicy(root)
         self.root = self.policy.root
         self.checks = checks or {}
         self.interface_map = ProjectMap(self.policy)
         self.interface_memory_enabled = True
+        self.git_enabled = git_enabled
+        self.available = False
+        if not git_enabled:
+            return
         try:
             probe = self._run(["rev-parse", "--show-toplevel"], check=False)
             discovered = probe["stdout"].strip()
@@ -109,6 +113,8 @@ class RepositoryTools:
             raise ToolError("not_a_repository", "Workspace is not the root of a Git repository.")
 
     def _run(self, arguments, input_text=None, check=True):
+        if not self.git_enabled:
+            raise ToolError('git_disabled', 'Git tools are disabled.')
         environment = os.environ.copy()
         environment.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat",
                             "GIT_TERMINAL_PROMPT": "0"})
@@ -520,6 +526,7 @@ class RepositoryTools:
         if not isinstance(content, str) or len(content) > self.MAX_PATCH or '\0' in content:
             raise ToolError('invalid_content', 'content must be UTF-8 text up to 200000 characters without NUL bytes.')
         self._reject_archive_marker(content)
+        self._validate_source(path, content)
         target = self.policy.resolve_write(path)
         requested = self.root / self.policy.relative(path)
         if os.path.lexists(requested) or target.exists():
@@ -632,6 +639,7 @@ class RepositoryTools:
             raise ToolError("no_change", "Replacement makes no change.")
         if len(updated) > 2_000_000:
             raise ToolError("file_too_large", "Result exceeds 2000000 bytes.")
+        self._validate_source(path, updated.decode('utf-8'))
         temp_name = None
         warnings = []
         try:
@@ -653,6 +661,14 @@ class RepositoryTools:
         relative = self.policy.relative(path).as_posix()
         return self._edit_result(relative, text, updated.decode('utf-8'), replacements=1,
                                  content_sha256=hashlib.sha256(updated).hexdigest(), warnings=warnings)
+
+    def _validate_source(self, path, text):
+        if getattr(self, 'validate_python', False) and Path(path).suffix == '.py':
+            try:
+                compile(text, str(path), 'exec', dont_inherit=True)
+            except SyntaxError as error:
+                raise ToolError('invalid_python', 'Python syntax error; no file was changed.',
+                    path=path, line=error.lineno, diagnostic=error.msg) from error
 
     def apply_patch(self, patch):
         paths = self._patch_paths(patch)

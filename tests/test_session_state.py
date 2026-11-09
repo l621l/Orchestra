@@ -66,7 +66,7 @@ class Continuation(unittest.IsolatedAsyncioTestCase):
         settings=json.loads((fixtures.BASE/'settings.json').read_text())
         self.assertEqual(settings['execution']['iterations_per_task'],1)
         self.assertFalse(settings['execution']['stop_after_confirmation'])
-        self.assertEqual(settings['execution']['max_api_calls_per_turn'],100)
+        self.assertEqual(settings['execution']['max_api_calls_per_turn'],300)
 
     async def test_resume_with_clarification_preserves_original_and_current_focus(self):
         self.settings['execution'].update(iterations_per_task=1,stop_after_confirmation=False)

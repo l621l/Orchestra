@@ -1,50 +1,49 @@
 {
   "api": {
-    "timeout_seconds": 60.0,
+    "timeout_seconds": 180,
     "max_retries": 0
   },
   "generation": {
-    "max_completion_tokens": 4096,
-    "temperature": 1.0,
-    "top_p": 0.95
+    "max_output_tokens": 4096
   },
   "execution": {
-    "max_api_calls_per_turn": 100,
+    "max_api_calls_per_turn": 300,
     "max_steps_per_agent": 100,
-    "final_answer_target_tokens": 512,
+    "final_answer_target_tokens": 768,
     "iterations_per_task": 1,
     "stop_after_confirmation": false,
-    "compact_tool_history": true,
-    "compaction_threshold_characters": 12000,
-    "recovery_max_completion_tokens": 4096,
     "project_map_enabled": true,
     "project_map_context_characters": 2500,
     "research_calls_before_action": 4,
     "implementation_calls_reserve": 4,
     "max_output_tokens_per_turn": 20000,
-    "final_output_reserve_tokens": 512,
-    "context_economy_enabled": true
+    "final_output_reserve_tokens": 2048
   },
   "roles": {
-    "director": {
+    "worker": {
       "max_delegations": 0
     }
   },
   "tools": {
     "editing_enabled": true,
     "allow_git_mutations": false,
-    "git_history_enabled": false
+    "git_history_enabled": false,
+    "git_tools_enabled": false
   },
-  "checks": {
-    "python_tests": [
-      "{python}",
-      "-B",
-      "-m",
-      "unittest",
-      "discover",
-      "-s",
-      "tests",
-      "-v"
-    ]
+  "checks": {},
+  "reasoning_effort": "low",
+  "pipeline": {
+    "writer_calls": 5,
+    "strong_calls": 1,
+    "early_error_threshold": 3,
+    "strong_context_characters": 6000,
+    "strong_request_characters": 16000,
+    "writer_context_characters": 12000,
+    "writer_request_characters": 96000,
+    "no_progress_calls": 6,
+    "recovery_calls": 4,
+    "repeated_action_limit": 3,
+    "max_task_calls": 24,
+    "max_task_cost_usd": 1.0
   }
 }

@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openai import AsyncOpenAI, APITimeoutError
+from openai import APIConnectionError, APIStatusError, APITimeoutError
 from rich import box
 from rich.console import Console
 from rich.live import Live
@@ -19,11 +19,12 @@ from rich.table import Table
 from rich.text import Text
 from project_map import ProjectMap
 from session_state import SessionState
-from context_compaction import compact_tool_history, transcript_characters, context_breakdown
+from context_compaction import transcript_characters
 from tools import FILE_TOOLS, ProjectTools, parse_arguments
 from git_tools import GIT_TOOLS, GIT_TOOL_NAMES, WORKSPACE_TOOL_NAMES, RepositoryTools
 from tool_contracts import EDIT_TOOL_NAMES, validate_arguments
 from tool_errors import ToolError, model_result
+from tool_schema import compact_tools
 
 BASE = Path(__file__).resolve().parent
 
@@ -118,6 +119,33 @@ class AgentDashboard:
         self.output_used = 0
         self.output_limit = 20000
         self.output_estimated = False
+        self.models = {}
+        self.active_model = None
+        self.cycle = ''
+
+    def configure_models(self, models):
+        self.models = dict(models)
+
+    def resolve_label(self, label):
+        return (self.active_model or 'writer') if self.models and label == 'worker' else label
+
+    def activate_model(self, label, step, total, early=False, next_model=None):
+        if self.active_model and self.active_model != label:
+            self.finish(self.active_model, 'waiting', 'Waiting for next turn')
+        self.active_model = label
+        self.cycle = ('Expert on demand' if step is None else f'Step {step}/{total}') + (' (recovery)' if early else '')
+        if next_model:
+            self.cycle += ' | Next: '+next_model
+        self.update(label, activity='Preparing request')
+
+    def record_usage(self, label, entry):
+        label = self.resolve_label(label)
+        if label not in self.states:
+            self.update(label)
+        self.states[label].update(calls=entry.get('api_calls',0),
+            input_tokens=entry.get('prompt_tokens',0),
+            output_tokens=entry.get('output_budget_tokens',entry.get('completion_tokens',0)),
+            estimated=entry.get('output_budget_estimated',False))
 
     @staticmethod
     def clean(value, limit=240):
@@ -133,6 +161,12 @@ class AgentDashboard:
             detail = f"{detail or '.'} | {args.get('query', args.get('pattern', ''))}"
         elif name == 'run_check':
             detail = args.get('name', '')
+        elif name == 'run_command':
+            detail = ' '.join(args.get('argv',[]))
+        elif name == 'finish_task':
+            detail = args.get('id','')
+        elif name == 'set_plan':
+            detail = f"{len(args.get('tasks',[]))} tasks"
         elif name == 'git_show':
             detail = f"{args.get('revision', '')} {detail}"
         elif name == 'git_create_branch':
@@ -142,16 +176,17 @@ class AgentDashboard:
         return cls.clean(f'{name} {detail}'.strip())
 
     def action(self, label, message, failed=False):
+        label = self.models.get(self.resolve_label(label), label)
         stamp = datetime.now().strftime('%H:%M:%S')
         self.console.print(Text(f'{stamp} [{label}] {self.clean(message, 650)}',
                                 style='red' if failed else None))
 
     def tool_finished(self, label, name, args, output, duration):
         value = output.get('result', {})
-        failed = not output['ok'] or (name == 'run_check' and not value.get('passed', False))
+        failed = not output['ok'] or (name in {'run_check','run_command'} and not value.get('passed', False))
         if not output['ok']:
             detail = f"{output.get('error')}: {output.get('message', '')}"
-        elif name == 'run_check':
+        elif name in {'run_check','run_command'}:
             detail = f"{'PASS' if value.get('passed') else 'FAIL'} (exit={value.get('returncode')})"
         elif name in EDIT_TOOL_NAMES:
             detail = f"changed {', '.join(value.get('files', []))}"
@@ -173,45 +208,61 @@ class AgentDashboard:
             # Keep the actual final traceback, with literal terminal text.
             self.console.print(Text(''.join(c for c in str(diagnostic)[-3000:]
                                            if c.isprintable() or c in '\n\t'), style='red'))
+        self.update(label, activity=f'{self.describe_tool(name,args)} -> {detail}')
 
     def render(self):
-        table = Table(title=Text(self.title), box=box.ROUNDED, expand=True,
+        title = self.title + (f' | {self.cycle}' if self.cycle else '')
+        table = Table(title=Text(title), box=box.ASCII, expand=True,
                       header_style="bold cyan", border_style="bright_black")
-        table.add_column("Agent", style="bold", no_wrap=True)
+        table.add_column("Model", style="bold", no_wrap=True)
         table.add_column("Status", no_wrap=True)
-        table.add_column("Activity")
+        table.add_column("Doing now")
         table.add_column("Time", justify="right", no_wrap=True)
-        table.add_column("Stream", justify="right", no_wrap=True)
-        table.add_column("Tokens", justify="right", no_wrap=True)
+        table.add_column("Calls", justify="right", no_wrap=True)
+        table.add_column("Input", justify="right", no_wrap=True)
+        table.add_column("Output", justify="right", no_wrap=True)
         table.add_column("Spent", justify="right", no_wrap=True,
                          style="bright_green")
         total_cost = 0.0
         known_costs = False
+        total_calls = total_input = 0
+        def compact_tokens(value):
+            return (f"{value / 1000:.1f}".rstrip('0').rstrip('.') + 'k') if value >= 1000 else str(value)
         for label, state in self.states.items():
             prefix = "  +-- " if state["depth"] else ""
             elapsed = state.get("duration")
             if elapsed is None:
-                elapsed = time.monotonic() - state["started"]
+                elapsed = state.get('accumulated',0) + time.monotonic() - state["started"]
             status = state["status"]
             status_style = {"running": "yellow", "done": "green",
                             "partial": "yellow", "failed": "red"}.get(status, "white")
-            chunks = f"{state['chunks']} chunks" if state["chunks"] else "â€”"
             cost = state.get("cost")
             if cost is None:
-                cost_text = "â€”"
+                cost_text = "-"
             else:
                 cost_text = f"${cost:.5f}"
+                if state.get('estimated'):
+                    cost_text = '~'+cost_text
                 total_cost += cost
                 known_costs = True
-            table.add_row(prefix + label, f"[{status_style}]{status}[/{status_style}]",
-                          Text(state["activity"]), f"{elapsed:.1f}s", chunks, "", cost_text)
+            calls = state.get('calls',0)
+            total_calls += calls
+            total_input += state.get('input_tokens',0)
+            output = compact_tokens(state.get('output_tokens',0))
+            if state.get('estimated'):
+                output = '~'+output
+            display_status = 'working' if status == 'running' else status
+            table.add_row(Text(prefix + self.models.get(label,label)), f"[{status_style}]{display_status}[/{status_style}]",
+                          Text(state["activity"]), f"{elapsed:.1f}s", str(calls),
+                          compact_tokens(state.get('input_tokens',0)), output, cost_text)
         if self.states:
             table.add_section()
-            def compact_tokens(value):
-                return (f"{value / 1000:.1f}".rstrip('0').rstrip('.') + 'к') if value >= 1000 else str(value)
             tokens = f"{compact_tokens(self.output_used)}/{compact_tokens(self.output_limit)}"
-            table.add_row("TOTAL", "", "completed API calls", "", "", tokens,
-                          f"${total_cost:.5f}" if known_costs else "â€”")
+            if self.output_estimated:
+                tokens = '~'+tokens
+            table.add_row("TOTAL", "", "Output budget (incl. reasoning)", "", str(total_calls),
+                          compact_tokens(total_input), tokens,
+                          f"${total_cost:.5f}" if known_costs else "-")
         return table
 
     def update_output_budget(self, used, limit, estimated=False):
@@ -226,7 +277,12 @@ class AgentDashboard:
         self.output_used = 0
         self.output_limit = output_limit
         self.output_estimated = False
-        self.title = f"Orchestra Â· {topic}"
+        self.active_model = None
+        self.cycle = ''
+        self.title = f"Orchestra | {topic}"
+        for label in self.models:
+            self.update(label, status='waiting', activity='Not called yet')
+            self.states[label]['duration'] = 0
         self.live = Live(self.render(), console=self.console, refresh_per_second=4,
                          transient=False)
         self.live.start()
@@ -239,11 +295,16 @@ class AgentDashboard:
 
     def update(self, label, depth=0, activity="waiting", chunks=0,
                status="running", cost=None):
+        label = self.resolve_label(label)
         state = self.states.setdefault(label, {
             "depth": depth, "started": time.monotonic(), "duration": None,
             "status": "running", "activity": "starting", "chunks": 0,
             "cost": None,
+            "accumulated": 0,
         })
+        if state["status"] != "running" and status == "running":
+            state["started"] = time.monotonic()
+            state["duration"] = None
         state.update(depth=depth, activity=activity, chunks=chunks, status=status)
         if cost is not None:
             state["cost"] = cost
@@ -251,10 +312,19 @@ class AgentDashboard:
             self.live.update(self.render(), refresh=True)
 
     def finish(self, label, status="done", activity="completed"):
+        if self.models and label == 'worker':
+            for model_label in self.models:
+                active = model_label == self.active_model
+                self.finish(model_label, status if active else 'done',
+                            activity if active else 'Turn finished')
+            return
+        label = self.resolve_label(label)
         state = self.states.get(label)
         if not state:
             return
-        state["duration"] = time.monotonic() - state["started"]
+        if state['status'] == 'running':
+            state['accumulated'] = state.get('accumulated',0) + time.monotonic() - state['started']
+        state["duration"] = state.get('accumulated',0)
         state["status"] = status
         state["activity"] = activity
         if self.live:
@@ -462,11 +532,14 @@ class Orchestra:
         self.pricing = pricing
         validate_settings(settings)
         validate_prompts(prompts)
-        self.role_settings("director")
+        self.role_settings("worker")
+        if settings.get('reasoning_effort','low') not in {'none','low','medium','high','xhigh','max'}:
+            raise ValueError('Unsupported Luna reasoning_effort.')
         self.files = ProjectTools(workspace)
         checks = {name: [sys.executable if arg == '{python}' else arg for arg in argv]
                   for name, argv in settings.get('checks', {}).items()}
-        self.repository = RepositoryTools(workspace, policy=self.files.policy, checks=checks)
+        self.repository = RepositoryTools(workspace, policy=self.files.policy, checks=checks,
+            git_enabled=settings.get('tools', {}).get('git_tools_enabled', False))
         self.project_map = self.repository.interface_map
         self.repository.interface_memory_enabled = settings['execution'].get('project_map_enabled',True)
         self.clients = {}
@@ -476,7 +549,9 @@ class Orchestra:
         self.session_state=SessionState(self.logs_path,self.files.root)
 
     def role_settings(self, role):
-        settings = self.config.get("roles", {}).get(role)
+        if role != 'worker':
+            raise ValueError('This runner permits only the single Luna worker.')
+        settings = self.config.get("roles", {}).get('worker')
         if not isinstance(settings, dict):
             raise ValueError(f"Configure roles.{role} with provider and model.")
         provider = settings.get("provider")
@@ -485,6 +560,8 @@ class Orchestra:
             raise ValueError(f"roles.{role}.provider must reference a configured provider.")
         if not isinstance(model, str) or not model.strip():
             raise ValueError(f"roles.{role}.model must be a non-empty string.")
+        if model != 'gpt-6-luna':
+            raise ValueError('GPT branch permits only roles.worker.model=gpt-6-luna; other roles cannot run.')
         return settings
 
     def begin_usage(self, turn_usage, label, role, provider, model):
@@ -501,6 +578,7 @@ class Orchestra:
     def add_usage(entry, usage, actual_model):
         if usage is None:
             return
+        entry["cache_write_tokens"] = entry.get("cache_write_tokens", 0) + (usage.get("prompt_tokens_details", {}).get("cache_write_tokens", 0) or 0)
         entry["reported_calls"] += 1
         entry["model"] = actual_model or entry["model"]
         entry["prompt_tokens"] += usage.get("prompt_tokens", 0) or 0
@@ -516,8 +594,10 @@ class Orchestra:
                  .get(entry["model"]))
         if not rates:
             return None
-        uncached = max(0, entry["prompt_tokens"] - entry["cached_tokens"])
+        writes = entry.get("cache_write_tokens", 0)
+        uncached = max(0, entry["prompt_tokens"] - entry["cached_tokens"] - writes)
         return ((uncached * rates["input_cache_miss"]
+                 + writes * rates.get("input_cache_write", rates["input_cache_miss"])
                  + entry["cached_tokens"] * rates["input_cache_hit"]
                  + entry["completion_tokens"] * rates["output"]) / 1_000_000)
 
@@ -596,154 +676,10 @@ class Orchestra:
               f"{total_cost_text}{suffix}")
 
     async def request(self, role, messages, tools, resource_status, turn_usage,
-                      trace, task_id, label=None, force_final=False, *, thinking_override=None, max_completion_tokens=None):
-        settings = self.role_settings(role)
-        label = label or role
-        provider_name = settings["provider"]
-        usage_entry = self.begin_usage(turn_usage, label, role,
-                                       provider_name, settings["model"])
-        if provider_name not in self.clients:
-            provider = self.config["providers"][provider_name]
-            self.clients[provider_name] = AsyncOpenAI(api_key=provider["api_key"],
-                base_url=provider["base_url"],
-                timeout=self.settings["api"]["timeout_seconds"],
-                max_retries=self.settings["api"]["max_retries"])
-        start = time.monotonic()
-        request_id = trace.new_id("req")
-        content, reasoning, calls = [], [], {}
-        usage = response_id = actual_model = finish = None
-        output_limit = max_completion_tokens or self.settings['generation']['max_completion_tokens']
-        error_type = None
-        received = 0
-        request_messages = [*messages, {"role": "system",
-            "content": resource_status}]
-        removed_reasoning = 0
-        if thinking_override == 'disabled' and settings['model'].lower().startswith('mimo'):
-            removed_reasoning = sum(len(m.get('reasoning_content') or '') for m in request_messages)
-            request_messages = [{k:v for k,v in message.items() if k != 'reasoning_content'}
-                                for message in request_messages]
-        if force_final:
-            request_messages.append({"role": "system",
-                "content": self.prompts["final_response"]})
-        request_metrics = {"messages": len(request_messages),
-                           "characters": self.message_characters(request_messages),
-                           "tools_available": len(tools) if not force_final else 0,
-                           "forced_final": force_final,
-                           "thinking_override": thinking_override,
-                           "max_completion_tokens": output_limit}
-        request_metrics['context_characters'] = context_breakdown(request_messages, [] if force_final else tools)
-        request_metrics['reasoning_characters_omitted'] = removed_reasoning
-        trace.event('context_composition', task_id=task_id, request_id=request_id,
-                    reasoning_characters_omitted=removed_reasoning, **request_metrics['context_characters'])
-        depth = trace.tasks[task_id]["depth"]
-        self.dashboard.update(label, depth, "waiting for model", 0)
-        try:
-            request_args = dict(
-                model=settings["model"], messages=request_messages,
-                **self.settings["generation"],
-                stream=True, stream_options={"include_usage": True},
-            )
-            request_args['max_completion_tokens'] = output_limit
-            if thinking_override is not None and settings['model'].lower().startswith('mimo'):
-                request_args['extra_body'] = {'thinking': {'type': thinking_override}}
-            if tools and not force_final:
-                request_args["tools"] = tools
-            stream = await self.clients[provider_name].chat.completions.create(**request_args)
-            async with stream:
-                async for chunk in stream:
-                    response_id, actual_model = chunk.id, chunk.model
-                    if chunk.usage is not None:
-                        usage = chunk.usage.model_dump(mode="json", exclude_none=True)
-                    if not chunk.choices:
-                        continue
-                    choice = chunk.choices[0]
-                    delta = choice.delta
-                    if delta.content:
-                        content.append(delta.content)
-                    thought = getattr(delta, "reasoning_content", None)
-                    if thought:
-                        reasoning.append(thought)
-                    for part in delta.tool_calls or []:
-                        call = calls.setdefault(part.index, {"id": "", "type": "function",
-                            "function": {"name": "", "arguments": ""}})
-                        if part.id:
-                            call["id"] = part.id
-                        if part.function:
-                            call["function"]["name"] += part.function.name or ""
-                            call["function"]["arguments"] += part.function.arguments or ""
-                    received += 1
-                    if content:
-                        phase = "writing answer"
-                    elif reasoning:
-                        phase = "reasoning"
-                    else:
-                        phase = "receiving stream"
-                    self.dashboard.update(label, depth, phase, received)
-                    if choice.finish_reason is not None:
-                        finish = choice.finish_reason
-            if finish == 'length':
-                trace.write_json(f'{request_id}_truncated.json', {
-                    'content': ''.join(content), 'tool_calls':list(calls.values()),
-                    'executed':False, 'output_limit':output_limit})
-                raise OutputLimitError(
-                    f'Output token limit reached; max_completion_tokens={output_limit}; '
-                    f'visible answer={sum(map(len, content))} characters; tool calls={len(calls)}. '
-                    'No tools executed yet; the runtime will validate any complete prefix.', draft=''.join(content) or None, tool_drafts=[calls[i] for i in sorted(calls)])
-            partial = False
-            if finish not in {"stop", "tool_calls"}:
-                reason = ('Output token limit reached' if finish == 'length' else
-                          'Provider content filter stopped the response' if finish == 'content_filter'
-                          else f'Incomplete model response (finish_reason={finish})')
-                raise ModelResponseError(
-                    f'{reason}; max_completion_tokens={self.settings["generation"]["max_completion_tokens"]}; '
-                    f'visible answer={sum(map(len, content))} characters; '
-                    f'tool calls={len(calls)}. No tools from this response were executed.')
-            message = {"role": "assistant", "content": "".join(content) or None}
-            if partial:
-                message["_partial"] = True
-            if reasoning:
-                message["reasoning_content"] = "".join(reasoning)
-            if calls:
-                if finish != "tool_calls" or any(not c["id"] or not c["function"]["name"] for c in calls.values()):
-                    raise ModelResponseError("Incomplete tool call; no tools from this response were executed.")
-                message["tool_calls"] = [calls[i] for i in sorted(calls)]
-            return message
-        except Exception as error:
-            error_type = type(error).__name__
-            description = error_description(error)
-            trace.error_message = description
-            trace.event('model_request_error', task_id=task_id, request_id=request_id,
-                        error_type=error_type, message=description, finish_reason=finish)
-            self.dashboard.action(label, description, failed=True)
-            raise
-        finally:
-            duration = time.monotonic() - start
-            activity = "request failed" if error_type else "response received"
-            self.add_usage(usage_entry, usage, actual_model)
-            # Missing usage must not turn the shared output ceiling into an
-            # unlimited budget. Conservatively charge this request's full cap.
-            measured = usage.get('completion_tokens') if isinstance(usage, dict) else None
-            charged = measured if type(measured) is int and measured >= 0 else output_limit
-            usage_entry['output_budget_tokens'] = usage_entry.get('output_budget_tokens', 0) + charged
-            if type(measured) is not int or measured < 0:
-                usage_entry['output_budget_estimated'] = True
-            self.dashboard.update_output_budget(
-                sum(entry.get('output_budget_tokens', entry.get('completion_tokens',0)) for entry in turn_usage.values()),
-                self.settings['execution'].get('max_output_tokens_per_turn',20000),
-                estimated=any(entry.get('output_budget_estimated',False) for entry in turn_usage.values()))
-            current_cost = self.estimated_cost(usage_entry) if usage is not None else None
-            self.dashboard.update(label, depth, activity, received,
-                                  "failed" if error_type else "running",
-                                  cost=current_cost)
-            response_metrics = {"chunks": received,
-                                "answer_characters": sum(map(len, content)),
-                                "reasoning_characters": sum(map(len, reasoning)),
-                                "tool_calls": len(calls),
-                                "tool_names": [call["function"]["name"]
-                                               for call in calls.values()]}
-            trace.record_request(task_id, request_id, response_id, provider_name,
-                settings["model"], actual_model, duration, finish, usage, error_type,
-                request_metrics, response_metrics)
+                      trace, task_id, label=None, force_final=False, *, max_output_tokens=None):
+        from responses_transport import request
+        return await request(self,role,messages,tools,resource_status,turn_usage,trace,task_id,
+                             label,force_final,max_output_tokens)
 
     async def run_user_task(self, text, turn_usage, trace, root_task_id):
         task=text
@@ -772,7 +708,7 @@ class Orchestra:
             trace.event('session_resumed',task_id=root_task_id,previous_turn=saved.get('turn_id'),
                         original_task=task,handoff_characters=len(initial_handoff),
                         clarification=clarification,clarifications_count=len(clarifications))
-            self.dashboard.action('director','Continuing saved task: '+self.dashboard.clean(task,120))
+            self.dashboard.action('worker','Continuing saved task: '+self.dashboard.clean(task,120))
         else:
             try:
                 self.session_state.save(task,json.dumps({'report':{'summary':
@@ -796,8 +732,8 @@ class Orchestra:
         for index in range(1, count + 1):
             label = f'iteration-{index}'
             self.dashboard.action(label, f'Starting iteration {index}/{count}; '
-                                  f'up to {allocation} API calls; first thinking, then disabled.')
-            messages = [{'role':'system','content': self.prompts['director']},
+                                  f'up to {allocation} API calls; Responses reasoning=' + execution.get('reasoning_effort', self.settings.get('reasoning_effort','low')) + '.')
+            messages = [{'role':'system','content': self.prompts['worker']},
                         {'role':'user','content':task}]
             if handoff is not None:
                 messages.append({'role':'user','content':
@@ -835,8 +771,8 @@ class Orchestra:
                         handoff_characters=len(handoff or ''), confirmation=confirmation_pending)
             budget = {'calls':allocation}
             try:
-                latest = await self.run('director', messages, budget, turn_usage, trace, child,
-                    max_calls=allocation, label=label, single_thinking=True)
+                latest = await self.run('worker', messages, budget, turn_usage, trace, child,
+                    max_calls=allocation, label=label)
             except BaseException as error:
                 trace.finish_task(child, 'cancelled' if isinstance(error, asyncio.CancelledError)
                                   else 'failed', type(error).__name__)
@@ -927,6 +863,8 @@ class Orchestra:
         result = list(FILE_TOOLS)
         for tool in GIT_TOOLS:
             name = tool['function']['name']
+            if not options.get('git_tools_enabled', False) and name not in {'create_file','replace_text','run_check'}:
+                continue
             if not self.repository.available and name not in WORKSPACE_TOOL_NAMES:
                 continue
             if name in EDIT_TOOL_NAMES and not options.get('editing_enabled', True):
@@ -943,25 +881,11 @@ class Orchestra:
                 tool = copy.deepcopy(tool)
                 tool['function']['parameters']['properties']['name']['enum'] = sorted(self.repository.checks)
             result.append(tool)
-        descriptions = {
-            'create_file':'Create a new UTF-8 file; fails if it exists. Include interface_notes for changed public contracts.',
-            'replace_text':'Replace one exact unique UTF-8 fragment. Read current text first. Optional source hash and interface_notes.',
-            'apply_patch':'Apply a complete Git unified text diff. Creates/modifies only; no deletion, rename or binary data. Optional interface_notes.',
-            'run_check':'Run a configured check in the workspace, in batch order. Returns exit status and diagnostics.',
-            'git_status':'Inspect branch and changed paths.', 'git_diff':'Inspect tracked staged/unstaged changes; excludes untracked contents.',
-            'list_files':'List a bounded tree; use continuation_paths for deeper directories.',
-            'read_file':'Read UTF-8 source with 1-based line numbers, continuation and full-file content_sha256.',
-            'search_text':'Search literal text; optional glob and bounded context. Continue with next_cursor using the same query.',
-            'search_regex':'Search a line-based regular expression. Same paging as search_text; prefer literals when possible.'}
-        exposed=copy.deepcopy(result)
-        for tool in exposed:
-            if tool['function']['name'] in descriptions:
-                tool['function']['description']=descriptions[tool['function']['name']]
-        return exposed
+        return compact_tools(result)
 
     async def run(self, role, messages, budget, turn_usage, trace, task_id,
-                  max_delegations=0, max_calls=None, label=None, single_thinking=False):
-        if role != 'director' or max_delegations:
+                  max_delegations=0, max_calls=None, label=None):
+        if role != 'worker' or max_delegations:
             raise ValueError('tools-only runs one model; delegation is disabled.')
         label = label or role
         tools = self.available_tools()
@@ -971,9 +895,9 @@ class Orchestra:
         revision, changed, checks, edit_errors = 0, set(), {}, set()
         recovery_attempts = 0
         recovering_length = False
-        thinking_disabled_for_turn = False
         saved_draft = None
         completion_repairs = 0
+        transient_retries = 0
         continuation_signature = None
         continuation_repeats = 0
         research_warning_sent = False
@@ -983,20 +907,21 @@ class Orchestra:
         def result(answer, partial=False):
             required = set(self.repository.checks)
             passed = {name for name, (rev, ok) in checks.items() if rev == revision and ok}
-            verified = bool(required) and required <= passed
+            verified = bool(required) and required <= passed or not required and 'runtime' in passed
             check_status = ('failed' if any(rev == revision and not ok for rev, ok in checks.values())
                             else 'passed' if verified else 'not_run_or_stale' if required else 'not_configured')
             return {'answer': answer or 'No answer text received.',
                     'status': 'partial' if partial or edit_errors or check_status == 'failed'
-                              or (changed and not verified) else 'completed',
+                              or (changed and not verified and getattr(self, 'require_checks_for_completion', True)) else 'completed',
                     'modified_files': sorted(changed),
                     'verification': {'status': check_status, 'revision': revision,
                         'checks': {name: {'revision': rev, 'passed': ok} for name, (rev, ok) in checks.items()}}}
 
+        direct = getattr(self, 'direct_mode', False)
         for step in range(call_limit):
             if budget['calls'] <= 0:
                 break
-            output_ceiling = self.settings['execution'].get('max_output_tokens_per_turn', 20000)
+            output_ceiling = float('inf') if direct else self.settings['execution'].get('max_output_tokens_per_turn', 20000)
             output_used = sum(entry.get('output_budget_tokens', entry.get('completion_tokens', 0))
                               for entry in turn_usage.values())
             output_remaining = max(0, output_ceiling - output_used)
@@ -1005,8 +930,8 @@ class Orchestra:
                 outcome['stop_reason'] = 'output_budget'
                 trace.event('output_budget_exhausted', task_id=task_id, used=output_used, limit=output_ceiling)
                 return outcome
-            final_reserve = min(self.settings['execution'].get('final_output_reserve_tokens', 512), output_ceiling)
-            force_final = step == call_limit - 1 or budget['calls'] == 1 or output_remaining <= final_reserve
+            final_reserve = 0 if direct else min(self.settings['execution'].get('final_output_reserve_tokens', 512), output_ceiling)
+            force_final = step == call_limit - 1 or budget['calls'] == 1 or output_remaining <= final_reserve+getattr(self,'min_working_output_tokens',0)
             research_limit = self.settings['execution'].get('research_calls_before_action', 4)
             reserve = self.settings['execution'].get('implementation_calls_reserve', 4)
             stalled = implementation_requested and not changed
@@ -1029,35 +954,21 @@ class Orchestra:
                 trace.event('research_checkpoint', task_id=task_id, reason=warning,
                             calls_used=step, calls_remaining=budget['calls'])
                 self.dashboard.action(label, 'Research checkpoint: focus on a concrete change or reproducing check.')
-            if self.settings['execution'].get('compact_tool_history', True):
-                archive = trace.directory / 'context' / f'{task_id}_{step}.json'
-                try:
-                    stats = compact_tool_history(messages, archive,
-                        threshold=self.settings['execution'].get('compaction_threshold_characters', 24000),
-                        verified=result('')['verification']['status']=='passed',
-                        economy=self.settings['execution'].get('context_economy_enabled',False))
-                    if stats:
-                        trace.event('context_compacted', task_id=task_id,
-                                    archive=str(archive.relative_to(trace.directory)), **stats)
-                        self.dashboard.action(label, f"Context compacted: {stats['characters_before']} -> {stats['characters_after']} characters")
-                except OSError:
-                    trace.event('context_compaction_skipped', task_id=task_id,
-                                reason='Archive could not be saved; original context retained.')
             prior = turn_usage.get(label, {})
-            effective_output_limit = (self.settings['execution'].get('recovery_max_completion_tokens',8192)
-                                      if thinking_disabled_for_turn else self.settings['generation']['max_completion_tokens'])
+            effective_output_limit = self.settings['generation']['max_output_tokens']
             effective_output_limit = min(effective_output_limit,
                 output_remaining if force_final else output_remaining - final_reserve)
             resource_status = self.prompts['resource_status'].format(
                 shared_calls_after=budget['calls'] - 1, agent_calls_after=call_limit-step-1,
                 delegations_remaining=0, tools_available='no' if force_final else 'yes',
-                max_completion_tokens=effective_output_limit,
+                max_output_tokens=effective_output_limit,
                 recommended_output_tokens=self.settings['execution']['final_answer_target_tokens'] if force_final
                     else effective_output_limit,
                 agent_input_tokens_used=prior.get('prompt_tokens', 0),
                 agent_output_tokens_used=prior.get('completion_tokens', 0),
                 agent_api_calls_used=prior.get('api_calls', 0))
-            resource_status += f'\nShared output budget: {output_remaining}/{output_ceiling} tokens remaining, including thinking and retries; request cap={effective_output_limit}.'
+            if not direct:
+                resource_status += f'\nShared output budget: {output_remaining}/{output_ceiling} tokens remaining, including thinking and retries; request cap={effective_output_limit}.'
             resource_status += '\nConfigured checks (exact argv; working directory is the workspace): ' + json.dumps(self.repository.checks, ensure_ascii=False)
             resource_status += '\nCurrent verification: ' + json.dumps(result('')['verification'])
             if self.settings['execution'].get('project_map_enabled',True):
@@ -1082,11 +993,18 @@ class Orchestra:
             try:
                 message = await self.request(role, messages, [] if force_final else tools, resource_status,
                     turn_usage, trace, task_id, label, force_final,
-                    thinking_override=('disabled' if force_final or thinking_disabled_for_turn
-                                       or (single_thinking and step > 0)
-                                       else 'enabled' if single_thinking else None),
-                    max_completion_tokens=effective_output_limit)
-            except APITimeoutError as error:
+                    max_output_tokens=effective_output_limit)
+            except (APIConnectionError, APIStatusError, TimeoutError) as error:
+                retryable = not isinstance(error, APIStatusError) or error.status_code >= 500
+                if (getattr(self, 'direct_mode', False) and retryable and transient_retries < 2
+                        and budget['calls'] > 0 and step + 1 < call_limit):
+                    transient_retries += 1
+                    trace.event('request_retry', task_id=task_id, attempt=transient_retries,
+                                reason=error_description(error))
+                    await asyncio.sleep(transient_retries)
+                    continue
+                if not isinstance(error, (APITimeoutError, TimeoutError)):
+                    raise
                 explanation = ('Model API timed out. Already-applied changes are preserved; '
                                'no commands from the unfinished response were executed. '
                                'Continue by inspecting current files and the last recorded checks.')
@@ -1116,18 +1034,23 @@ class Orchestra:
                 if can_retry:
                     recovery_attempts += 1
                     recovering_length = True
-                    thinking_disabled_for_turn = True
                     trace.event('output_limit_recovery_started', task_id=task_id,
                                 attempt=recovery_attempts, calls_remaining=budget['calls'],
-                                thinking_disabled_for_turn=True)
+                                reasoning_effort=self.settings.get('reasoning_effort','low'))
                 if prefix:
                     salvaged_length = True
                     length_stop_after_tools = not can_retry
                     message = {'role':'assistant','content':None,'tool_calls':prefix}
+                    if getattr(error,'response_items',None):
+                        ids={c['id'] for c in prefix}
+                        message['_response_items']=[item for item in error.response_items if item['type']=='reasoning' or item.get('call_id') in ids]
                     trace.event('output_limit_prefix_selected', task_id=task_id,
                                 selected=len(prefix), discarded=len(error.tool_drafts)-len(prefix))
                     self.dashboard.action(label, f'Output limit: executing {len(prefix)} complete validated calls; unfinished tail discarded.')
                 elif can_retry:
+                    reasoning_items=[item for item in getattr(error,'response_items',[]) if item['type']=='reasoning' and item.get('encrypted_content')]
+                    if reasoning_items:
+                        messages.append({'role':'assistant','content':None,'_response_items':reasoning_items})
                     messages.append({'role':'system','content':length_notice})
                     self.dashboard.action(label, 'Output limit: retrying one small step within the remaining budget.')
                     continue
@@ -1142,6 +1065,9 @@ class Orchestra:
                     outcome = result(answer, partial=True)
                     outcome['stop_reason'] = 'output_limit'
                     return outcome
+            if transient_retries and not salvaged_length:
+                transient_retries = 0
+                trace.error_message = None
             if recovering_length and not salvaged_length:
                 recovering_length = False
                 trace.error_message = None
@@ -1168,7 +1094,10 @@ class Orchestra:
                     pass
                 continuing = (not internal and isinstance(report, dict)
                     and report.get('state') == 'continue' and report.get('done') is False
-                    and all(isinstance(report.get(key), str) for key in ('summary', 'next_steps')))
+                    and isinstance(report.get('summary'), str)
+                    and (isinstance(report.get('next_steps'), str) or
+                         (isinstance(report.get('next_steps'), list) and
+                          all(isinstance(item, str) for item in report['next_steps']))))
                 if continuing:
                     signature = (revision, tuple(sorted(checks.items())))
                     continuation_repeats = continuation_repeats + 1 if signature == continuation_signature else 1
@@ -1178,7 +1107,7 @@ class Orchestra:
                     can_continue = (not force_final and budget['calls'] > 0 and step + 1 < call_limit
                                     and output_used_now < output_ceiling and continuation_repeats <= 2)
                     trace.event('continuation_report', task_id=task_id, resumed=can_continue,
-                                calls_remaining=budget['calls'], output_remaining=max(0, output_ceiling-output_used_now),
+                                calls_remaining=budget['calls'], output_remaining=None if direct else max(0, output_ceiling-output_used_now),
                                 reports_without_progress=continuation_repeats)
                     if can_continue:
                         messages.append({'role':'system','content':
@@ -1192,19 +1121,25 @@ class Orchestra:
                     outcome = result(answer, partial=True)
                     outcome['stop_reason'] = ('continuation_stalled' if continuation_repeats > 2
                                               else 'output_budget' if output_used_now >= output_ceiling
-                                              else 'report_budget_boundary')
+                                              else 'call_limit' if force_final else 'report_budget_boundary')
                     return outcome
                 no_progress = implementation_requested and not changed and not checks and not blocker
-                if internal or no_progress:
+                unverified_edit = (getattr(self, 'direct_mode', False)
+                    and self.requires_launch_verification() and not blocker and isinstance(report, dict)
+                    and report.get('done') is True
+                    and checks.get('runtime') != (revision, True))
+                if internal or no_progress or unverified_edit:
                     trace.event('premature_completion_rejected', task_id=task_id,
-                                internal_report=internal, no_progress=no_progress,
+                                internal_report=internal, no_progress=no_progress, unverified_edit=unverified_edit,
                                 calls_remaining=budget['calls'])
                     if not force_final and completion_repairs < 2 and budget['calls'] > 0:
                         completion_repairs += 1
                         messages.append({'role':'system','content':
-                            'The answer was rejected: internal history is not a final report, and research alone '
-                            'does not deliver an implementation request. Use current evidence to make a focused '
-                            'edit and run a relevant check. If already correct, demonstrate it with a check. '
+                            ('Completion rejected: run the current project after the latest edit and fix any failure. '
+                             if unverified_edit else
+                             'The answer was rejected: internal history is not a final report, and research alone '
+                             'does not deliver an implementation request. Use current evidence to make a focused '
+                             'edit and run a relevant check. If already correct, demonstrate it with a check. ') +
                             'If blocked, report needs_user with action, reason and concrete evidence. '
                             'Do not repeat exploration. Stay within the remaining budget.'})
                         self.dashboard.action(label, 'Premature report rejected; continuing within the remaining budget.')
@@ -1229,8 +1164,14 @@ class Orchestra:
                         ('\nModel diagnosis (unverified): ' + diagnosis[:2500] if diagnosis else ''),
                         'next_steps': next_step,
                         'done': False, 'state': 'continue', 'blocker': None}, ensure_ascii=False)
+                    facts['stop_reason'] = 'verification_required' if unverified_edit else 'premature_report'
                     return facts
-                return result(answer)
+                outcome = result(answer)
+                if force_final:
+                    outcome['stop_reason'] = 'call_limit' if direct else 'report_budget_boundary'
+                elif blocker:
+                    outcome['stop_reason'] = 'needs_user'
+                return outcome
             names = {c['function']['name'] for c in calls}
             exclusive = len(calls) > 1 and bool(names & {'git_create_branch', 'create_commit'})
             # Execute in response order. A later read sees earlier edits; checks
@@ -1259,7 +1200,8 @@ class Orchestra:
                             any(checks.get(key) != (revision, True) for key in self.repository.checks)):
                         raise ToolError('verification_required', 'Run every configured check successfully after the latest edit before committing.')
                     handler = self.repository if name in GIT_TOOL_NAMES else self.files
-                    operation = asyncio.create_task(asyncio.to_thread(handler.execute, name, args))
+                    execute=getattr(self,'execute_tool',handler.execute)
+                    operation = asyncio.create_task(asyncio.to_thread(execute, name, args))
                     try:
                         value = await asyncio.shield(operation)
                     except asyncio.CancelledError:
@@ -1274,9 +1216,18 @@ class Orchestra:
                         edit_errors.discard('*')
                     if name == 'run_check':
                         checks[args['name']] = (revision, value['passed'])
+                    elif name == 'run_command' and value.get('qualifies_as_verification'):
+                        checks['runtime'] = (revision, True)
+                    elif name == 'run_command' and value.get('passed') is False:
+                        checks['runtime'] = (revision, False)
                     summary = self.tool_result_summary(name, value)
                     if name in EDIT_TOOL_NAMES:
                         summary = {key: value.get(key) for key in ('applied', 'files', 'files_changed', 'warnings', 'interface_memory')}
+                    elif name == 'run_command':
+                        summary = {'passed': value.get('passed'), 'returncode': value.get('returncode'),
+                                   'output_tail': value.get('output', '')[-1600:],
+                                   'verified_copy': value.get('verified_copy'),
+                                   'checkpoint_error': value.get('checkpoint_error')}
                     elif name == 'run_check':
                         summary = {key: value.get(key) for key in ('name', 'passed', 'returncode', 'truncated')}
                     output = {'ok': True, 'result': model_result(name, value)}
@@ -1286,6 +1237,8 @@ class Orchestra:
                         edit_errors.add(args.get('path', '*'))
                     if name == 'run_check' and args.get('name') in self.repository.checks:
                         checks[args['name']] = (revision, False)
+                    elif name == 'run_command':
+                        checks['runtime'] = (revision, False)
                     output = {'ok': False, 'error': error.code, 'message': str(error), **error.details}
                 except Exception as error:
                     error_code = type(error).__name__
@@ -1293,6 +1246,8 @@ class Orchestra:
                         edit_errors.add(args.get('path', '*'))
                     if name == 'run_check' and args.get('name') in self.repository.checks:
                         checks[args['name']] = (revision, False)
+                    elif name == 'run_command':
+                        checks['runtime'] = (revision, False)
                     output = {'ok': False, 'error': 'internal_tool_error',
                               'message': error_description(error) + ' Inspect current files before retrying.'}
                 duration = time.monotonic() - started
@@ -1318,18 +1273,18 @@ class Orchestra:
                     outcome=result((saved_draft + '\n' if saved_draft else '') +
                         'Output/call budget boundary reached. Complete calls were processed; unfinished tail discarded. '
                         'Saved changes: ' + ', '.join(sorted(changed)),partial=True)
-                    outcome['stop_reason']='output_limit'
+                    outcome['stop_reason']='call_limit' if direct else 'output_limit'
                     return outcome
-        return result('Call budget exhausted. Inspect saved changes and verification results before continuing.', partial=True)
+        outcome = result('Call budget exhausted. Inspect saved changes and verification results before continuing.', partial=True)
+        outcome['stop_reason'] = 'call_limit'
+        return outcome
 
 
 def validate_settings(settings):
     ranges = {
         ("api", "timeout_seconds"): (0, None, False, False),
         ("api", "max_retries"): (0, None, True, True),
-        ("generation", "max_completion_tokens"): (1, None, True, True),
-        ("generation", "temperature"): (0, 2, False, True),
-        ("generation", "top_p"): (0, 1, False, False),
+        ("generation", "max_output_tokens"): (1, None, True, True),
         ("execution", "max_api_calls_per_turn"): (1, None, True, True),
         ("execution", "max_steps_per_agent"): (1, None, True, True),
         ("execution", "final_answer_target_tokens"): (1, None, True, True),
@@ -1342,9 +1297,9 @@ def validate_settings(settings):
                 or (value < low if inclusive else value <= low)
                 or (high is not None and value > high)):
             raise ValueError(f"Invalid settings: {section}.{name}")
-    if set(settings["generation"]) != {"max_completion_tokens", "temperature", "top_p"}:
+    if set(settings["generation"]) != {"max_output_tokens"}:
         raise ValueError("Unexpected generation setting.")
-    for role in ("director", "worker"):
+    for role in ("worker", "director", "writer", "tester"):
         value = settings.get("roles", {}).get(role, {}).get("max_delegations", 0)
         if type(value) is not int or value < 0 or value != 0:
             raise ValueError(f"Invalid settings: roles.{role}.max_delegations")
@@ -1360,21 +1315,11 @@ def validate_settings(settings):
         value = settings['execution'].get(key, 4)
         if type(value) is not int or value < 1:
             raise ValueError(f'{key} must be a positive integer.')
-    if type(settings['execution'].get('context_economy_enabled',False)) is not bool:
-        raise ValueError('context_economy_enabled must be boolean.')
-    if type(settings['execution'].get('compact_tool_history', True)) is not bool:
-        raise ValueError('compact_tool_history must be boolean.')
-    threshold = settings['execution'].get('compaction_threshold_characters', 24000)
-    if type(threshold) is not int or threshold < 4000:
-        raise ValueError('compaction_threshold_characters must be an integer >= 4000.')
     iterations = settings['execution'].get('iterations_per_task', 5)
     if type(iterations) is not int or not 1 <= iterations <= 20:
         raise ValueError('iterations_per_task must be an integer from 1 to 20.')
-    recovery_limit = settings['execution'].get('recovery_max_completion_tokens', 8192)
-    if type(recovery_limit) is not int or not 1 <= recovery_limit <= 32768:
-        raise ValueError('recovery_max_completion_tokens must be an integer from 1 to 32768.')
     options = settings.get('tools', {})
-    if (not isinstance(options, dict) or set(options) - {'editing_enabled', 'allow_git_mutations', 'git_history_enabled'}
+    if (not isinstance(options, dict) or set(options) - {'editing_enabled', 'allow_git_mutations', 'git_history_enabled', 'git_tools_enabled'}
             or any(type(value) is not bool for value in options.values())):
         raise ValueError('tools settings must contain supported boolean flags.')
     checks = settings.get('checks', {})
@@ -1383,12 +1328,12 @@ def validate_settings(settings):
             or any(not isinstance(arg, str) or not arg or '\0' in arg for arg in argv)
             for name, argv in checks.items())):
         raise ValueError('checks must map names to non-empty command argument arrays.')
-    if settings["execution"]["final_answer_target_tokens"] >= settings["generation"]["max_completion_tokens"]:
-        raise ValueError("final_answer_target_tokens must be smaller than max_completion_tokens.")
+    if settings["execution"]["final_answer_target_tokens"] >= settings["generation"]["max_output_tokens"]:
+        raise ValueError("final_answer_target_tokens must be smaller than max_output_tokens.")
 
 
 def validate_prompts(prompts):
-    required = {"director", "final_response", "resource_status"}
+    required = {"worker", "final_response", "resource_status"}
     if not isinstance(prompts, dict) or set(prompts) != required:
         raise ValueError(f"prompts.json must contain exactly: {', '.join(sorted(required))}.")
     for name, prompt in prompts.items():
@@ -1398,7 +1343,7 @@ def validate_prompts(prompts):
         prompts["resource_status"].format(
             shared_calls_after=0, agent_calls_after=0,
             delegations_remaining=0, tools_available="no",
-            max_completion_tokens=2, recommended_output_tokens=1,
+            max_output_tokens=2, recommended_output_tokens=1,
             agent_input_tokens_used=0, agent_output_tokens_used=0,
             agent_api_calls_used=0)
     except (KeyError, IndexError, ValueError) as error:
@@ -1419,18 +1364,31 @@ async def main():
         pricing = json.load(file)
     if args.workspace == BASE / "workspace":
         args.workspace.mkdir(exist_ok=True)
-    app = Orchestra(config, args.workspace, runtime_settings, prompts, pricing)
-    print(f"Single-model workspace: {app.files.root}")
-    for role in ("director",):
+    from direct_dev import DirectDevelopment as Pipeline
+    app = Pipeline(config, args.workspace, runtime_settings, prompts, pricing)
+    print(f"Pipeline workspace: {app.files.root}")
+    for role in ("writer", "strong"):
         settings = app.role_settings(role)
         print(f"{role}: {settings['provider']} / {settings['model']}")
+    from autodev_console import brief, input_command
     while True:
+        print('\n'+brief(app))
         try:
-            text = input("\nYou (exit to quit): ").strip()
+            text = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
             break
-        if text.lower() == "exit":
+        command,payload=input_command(text)
+        if command == 'exit':
             break
+        if command == 'status':
+            continue
+        if command == 'new' and not payload:
+            try:
+                payload=input('New task: ').strip()
+            except (EOFError,KeyboardInterrupt):
+                break
+            if not payload:continue
+            text='N: '+payload
         if not text:
             continue
         suggestion=SessionState.layout_suggestion(text)
@@ -1447,25 +1405,25 @@ async def main():
             text=suggestion
         turn_usage = {}
         trace = TurnTrace(app.logs_path, text, app.files.root)
-        root_task_id = trace.start_task("director", text)
+        root_task_id = trace.start_task("worker", text)
         app.dashboard.start(trace.turn_id, trace.topic,
-                            output_limit=app.settings['execution'].get('max_output_tokens_per_turn',20000))
+                            output_limit=app.total_output_limit)
         turn_status = "failed"
         turn_error = None
         try:
-            director_result = await app.run_user_task(text, turn_usage, trace, root_task_id)
-            trace.event('workspace_result', modified_files=director_result['modified_files'],
-                        verification=director_result['verification'],
-                        chain_state=director_result.get('chain_state'),
-                        blocker=director_result.get('blocker'),
-                        iterations=director_result.get('iterations'))
-            answer = director_result["answer"]
-            result_status = director_result["status"]
+            worker_result = await app.run_user_task(text, turn_usage, trace, root_task_id)
+            trace.event('workspace_result', modified_files=worker_result['modified_files'],
+                        verification=worker_result['verification'],
+                        chain_state=worker_result.get('chain_state'),
+                        blocker=worker_result.get('blocker'),
+                        iterations=worker_result.get('iterations'))
+            answer = worker_result["answer"]
+            result_status = worker_result["status"]
             trace.save_final_answer(answer)
             trace.finish_task(root_task_id, result_status)
-            activity = "output limit reached" if result_status == "partial" else "completed"
+            activity = "Work incomplete; see report" if result_status == "partial" else "Task completed"
             dashboard_status = "partial" if result_status == "partial" else "done"
-            app.dashboard.finish("director", dashboard_status, activity)
+            app.dashboard.finish("worker", dashboard_status, activity)
             app.dashboard.stop()
             turn_status = result_status
             print(f"\nAssistant:\n{answer}")
@@ -1476,14 +1434,14 @@ async def main():
             description = error_description(error)
             trace.error_message = description
             trace.event('turn_error', error_type=turn_error, message=description)
-            app.dashboard.finish("director", "failed", turn_error)
+            app.dashboard.finish("worker", "failed", turn_error)
             app.dashboard.stop()
             trace.finish_task(root_task_id, "failed", turn_error)
             print(f"Turn failed ({turn_error}): {description}\nLocal file changes were NOT rolled back.")
         except KeyboardInterrupt:
             turn_status = "cancelled"
             turn_error = "KeyboardInterrupt"
-            app.dashboard.finish("director", "failed", "cancelled")
+            app.dashboard.finish("worker", "failed", "cancelled")
             app.dashboard.stop()
             trace.finish_task(root_task_id, "cancelled", turn_error)
             print("\nTurn cancelled. Local file changes were NOT rolled back.")

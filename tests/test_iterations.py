@@ -28,7 +28,6 @@ class Iterations(unittest.IsolatedAsyncioTestCase):
         for index, (messages, budget, kwargs) in enumerate(calls):
             self.assertEqual(messages[1]['content'],'original task')
             self.assertEqual(budget['calls'],self.settings['execution']['max_api_calls_per_turn'])
-            self.assertTrue(kwargs['single_thinking'])
             self.assertEqual(len(messages),3 if index==0 else 4)
             if index:
                 self.assertIn(f'progress-{index}',messages[2]['content'])
@@ -42,10 +41,7 @@ class Iterations(unittest.IsolatedAsyncioTestCase):
             self.response(self.call('run_check',name='unit')),
             {'role':'assistant','content':'Checked'}])
         (self.root/'settings.txt').write_text('input')
-        result = await self.app.run('director',[],{'calls':8},{},self.trace,self.task,
-                                    single_thinking=True)
-        modes = [c.kwargs['thinking_override'] for c in self.app.request.call_args_list]
-        self.assertEqual(modes,['enabled','disabled','disabled','disabled'])
+        result = await self.app.run('worker',[],{'calls':8},{},self.trace,self.task)
         self.assertEqual(result['verification']['status'],'passed')
 
     async def test_bad_handoff_is_bounded_and_does_not_claim_done(self):
@@ -99,5 +95,5 @@ class Iterations(unittest.IsolatedAsyncioTestCase):
         tool = next(t for t in self.app.available_tools() if t['function']['name']=='run_check')
         self.assertEqual(tool['function']['parameters']['properties']['name']['enum'],['unit'])
         self.app.request = AsyncMock(return_value={'role':'assistant','content':'Report'})
-        await self.app.run('director',[],{'calls':4},{},self.trace,self.task)
+        await self.app.run('worker',[],{'calls':4},{},self.trace,self.task)
         self.assertIn('assert Path',self.app.request.call_args.args[3])

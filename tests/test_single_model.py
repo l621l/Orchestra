@@ -22,16 +22,17 @@ class SingleModel(unittest.IsolatedAsyncioTestCase):
         self.root = Path(temp.name)
         self.settings = json.loads((BASE/'settings.json').read_text())
         self.settings['execution'].update(iterations_per_task=5,stop_after_confirmation=True)
+        self.settings['tools']['git_tools_enabled'] = True  # Legacy Git opt-in tests.
         self.settings['checks'] = {'unit': ['{python}', '-B', '-c',
             "from pathlib import Path; assert Path('value.txt').read_text() == 'correct'"]}
         config = {'providers': {'offline': {}},
-                  'roles': {'director': {'provider': 'offline', 'model': 'offline'}}}
+                  'roles': {'worker': {'provider': 'offline', 'model': 'gpt-6-luna'}}}
         with patch('orchestra.BASE', self.root):
             self.app = Orchestra(config, self.root, self.settings,
                 json.loads((BASE/'prompts.json').read_text()), {})
         self.app.dashboard = MagicMock()
         self.trace = TurnTrace(self.root/'logs', 'offline test', self.root)
-        self.task = self.trace.start_task('director', 'offline test')
+        self.task = self.trace.start_task('worker', 'offline test')
 
     def call(self, tool_name, **args):
         return {'id': tool_name, 'type': 'function', 'function': {'name': tool_name, 'arguments': json.dumps(args)}}
@@ -43,7 +44,7 @@ class SingleModel(unittest.IsolatedAsyncioTestCase):
         self.app.request = AsyncMock(side_effect=responses)
         messages = []
         pool = {'calls': budget}
-        result = await self.app.run('director', messages, pool, {}, self.trace, self.task)
+        result = await self.app.run('worker', messages, pool, {}, self.trace, self.task)
         outputs = [json.loads(m['content']) for m in messages if m['role'] == 'tool']
         return result, outputs, pool
 
@@ -168,7 +169,7 @@ class SingleModel(unittest.IsolatedAsyncioTestCase):
     def test_settings_reject_shell_strings_and_delegation(self):
         for update in [{'checks': {'test': 'python -m unittest'}},
                        {'tools': {'editing_enabled':'yes'}},
-                       {'roles': {'director': {'max_delegations':1}}}]:
+                       {'roles': {'worker': {'max_delegations':1}}}]:
             value = copy.deepcopy(self.settings)
             value.update(update)
             with self.assertRaises(ValueError):
