@@ -90,6 +90,7 @@ class AutoDevelopment(unittest.IsolatedAsyncioTestCase):
 
     def test_cost_guard_blocks_before_transport_and_persists_across_continue(self):
         self.app.options['max_task_cost_usd']=.01
+        self.app._state['budget_spent']=.01
         payload={'model':'gpt-6.1-sol','input':[{'role':'user','content':'task'}],'max_output_tokens':4096}
         with self.assertRaisesRegex(ModelResponseError,'cost limit'):
             self.app.validate_request_input('strong',payload)
@@ -97,6 +98,32 @@ class AutoDevelopment(unittest.IsolatedAsyncioTestCase):
         self.app._state['budget_spent']=.009
         self.app.save_state();self.app.load_or_start('продолжи')
         self.assertEqual(self.app._state['budget_spent'],.009)
+
+    def test_request_can_cross_cost_cap_but_continue_cannot_cross_again(self):
+        self.app.options['max_task_cost_usd']=.1
+        self.app._state['budget_spent']=.099
+        payload={'model':'gpt-6.1-sol','input':[{'role':'user','content':'task'}],'max_output_tokens':4096}
+        self.app.validate_request_input('strong',payload)
+        self.assertGreater(self.app._reservation, .001)
+        # The admitted response costs .02, crossing the cap once.
+        self.app._state['budget_spent']+=.02
+        self.app._reservation=0
+        self.app.save_state();self.app.load_or_start('продолжи')
+        self.assertAlmostEqual(self.app._state['budget_spent'],.119)
+        with self.assertRaisesRegex(ModelResponseError,'cost limit'):
+            self.app.validate_request_input('strong',payload)
+        self.assertEqual(self.app._reservation,0)
+
+    def test_large_reserve_does_not_block_under_cap_or_replace_cost_guard(self):
+        self.app.options['max_task_cost_usd']=.01
+        payload={'model':'gpt-6.1-sol','input':[{'role':'user','content':'task'}],'max_output_tokens':4096}
+        self.app.validate_request_input('strong',payload)
+        self.assertGreater(self.app._reservation,.01)
+        # Missing usage is charged conservatively by request(), so it also blocks next time.
+        self.app._state['budget_spent']+=self.app._reservation
+        self.app._reservation=0
+        with self.assertRaisesRegex(ModelResponseError,'cost limit'):
+            self.app.validate_request_input('strong',payload)
 
     def test_generic_runtime_failure_and_timeout_are_not_success(self):
         result=run_command(self.app.repository,['{python}','-c','raise RuntimeError("boom")'])
@@ -115,6 +142,7 @@ class AutoDevelopment(unittest.IsolatedAsyncioTestCase):
 
     async def test_cost_rejection_does_not_advance_actual_model_cycle(self):
         self.app.options['max_task_cost_usd']=.000001
+        self.app._state['budget_spent']=.000001
         self.app._position=2
         with self.assertRaisesRegex(ModelResponseError,'cost limit'):
             await self.app.request('worker',self.app.context(12000),self.app.available_tools(),

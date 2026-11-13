@@ -10,11 +10,14 @@ def input_command(text):
     if lowered in {'n','т'}:return 'new',''
     for prefix in ('n:','т:','новая задача:','новое задание:'):
         if lowered.startswith(prefix):return 'new',stripped[len(prefix):].strip()
+    for prefix in ('d:', 'в:', 'debug:', 'дебаг:'):
+        if lowered.startswith(prefix):
+            return 'debug', stripped[len(prefix):].strip()
     return 'text',stripped
 
 
 def continuation_intent(text,has_checkpoint):
     command,payload=input_command(text)
-    if command=='new':return False,''
+    if command in {'new', 'debug'}:return False,''
     if command=='continue':return True,''
     return bool(has_checkpoint),payload if has_checkpoint else ''

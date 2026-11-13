@@ -29,14 +29,14 @@ def wire_messages(messages, config):
 
 
 async def request(app, role, messages, tools, resource_status, turn_usage, trace,
-                  task_id, label=None, force_final=False, max_output_tokens=None):
+                  task_id, label=None, force_final=False, max_output_tokens=None, disable_thinking=False):
     from orchestra import OutputLimitError, ModelResponseError, error_description
     config = app.role_settings(role)
     label = label or 'writer'
     provider = config['provider']
     cap = max_output_tokens or app.settings['generation']['max_output_tokens']
     wire = wire_messages(messages,config)
-    thinking='disabled' if force_final else config.get('thinking','enabled')
+    thinking='disabled' if force_final or disable_thinking else config.get('thinking','enabled')
     if thinking not in {'enabled','disabled'}:
         raise ValueError('thinking must be enabled or disabled.')
     wire.append({'role':'system','content':resource_status})

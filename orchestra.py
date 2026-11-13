@@ -283,7 +283,7 @@ class AgentDashboard:
         for label in self.models:
             self.update(label, status='waiting', activity='Not called yet')
             self.states[label]['duration'] = 0
-        self.live = Live(self.render(), console=self.console, refresh_per_second=4,
+        self.live = Live(get_renderable=self.render, console=self.console, refresh_per_second=4,
                          transient=False)
         self.live.start()
 
@@ -993,7 +993,7 @@ class Orchestra:
             try:
                 message = await self.request(role, messages, [] if force_final else tools, resource_status,
                     turn_usage, trace, task_id, label, force_final,
-                    max_output_tokens=effective_output_limit)
+                    max_output_tokens=effective_output_limit, **({"disable_thinking": True} if direct and recovering_length else {}))
             except (APIConnectionError, APIStatusError, TimeoutError) as error:
                 retryable = not isinstance(error, APIStatusError) or error.status_code >= 500
                 if (getattr(self, 'direct_mode', False) and retryable and transient_retries < 2

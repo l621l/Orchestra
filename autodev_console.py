@@ -3,7 +3,7 @@ import json
 from autodev_intent import input_command
 
 
-HELP='C=continue | N: <task>=new | S=status | Q=exit | text=update current task'
+HELP='C=continue | N: <task>=new | D: <error>=debug | S=status | Q=exit | text=update current task'
 
 
 def brief(app):
@@ -16,7 +16,8 @@ def brief(app):
         tasks=state['plan'];done=sum(t['status']=='done' for t in tasks)
         if state.get('mode')=='direct' or getattr(app,'direct_mode',False):
             code='DONE' if state.get('status')=='completed' else 'PAUSE'
-            line = f'[{code}] Direct | Changed files: {len(state.get("modified_files", []))} | Spent: ${state.get("budget_spent", 0):.4f}/${app.options["max_task_cost_usd"]:.2f}'
+            mode = 'Debug' if state.get('task_kind') == 'debug' else 'Direct'
+            line = f'[{code}] {mode} | Changed files: {len(state.get("modified_files", []))} | Spent: ${state.get("budget_spent", 0):.4f}/${app.options["max_task_cost_usd"]:.2f}'
             if state.get('stop_reason'):
                 line += ' | Stop: ' + state['stop_reason']
             command = state.get('last_command') or {}
