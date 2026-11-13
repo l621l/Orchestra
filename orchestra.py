@@ -1,30 +1,21 @@
 """Orchestra: a single coding model with bounded workspace tools."""
-import argparse
 import asyncio
 import copy
 import json
 import re
-import sys
 import time
 import traceback
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError
-from rich import box
-from rich.console import Console
-from rich.live import Live
-from rich.table import Table
-from rich.text import Text
-from project_map import ProjectMap
 from session_state import SessionState
 from context_compaction import transcript_characters
-from tools import FILE_TOOLS, ProjectTools, parse_arguments
-from git_tools import GIT_TOOLS, GIT_TOOL_NAMES, WORKSPACE_TOOL_NAMES, RepositoryTools
+from tools import parse_arguments
+from orchestra_tools import available_tools, tool_handler, workspace_tools
+from turn_state import TurnState
+from turn_trace import TurnTrace, utc_now
 from tool_contracts import EDIT_TOOL_NAMES, validate_arguments
 from tool_errors import ToolError, model_result
-from tool_schema import compact_tools
 
 BASE = Path(__file__).resolve().parent
 
@@ -72,10 +63,6 @@ def complete_tool_prefix(drafts, definitions, used_ids=()):
     return prefix
 
 
-def utc_now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
 class ModelResponseError(RuntimeError):
     """Known protocol failure with a safe, user-facing explanation."""
 
@@ -110,422 +97,8 @@ def error_description(error):
     return f'{name}{location}: unexpected local failure.'
 
 
-class AgentDashboard:
-    def __init__(self):
-        self.console = Console()
-        self.live = None
-        self.states = {}
-        self.title = "Orchestra"
-        self.output_used = 0
-        self.output_limit = 20000
-        self.output_estimated = False
-        self.models = {}
-        self.active_model = None
-        self.cycle = ''
-
-    def configure_models(self, models):
-        self.models = dict(models)
-
-    def resolve_label(self, label):
-        return (self.active_model or 'writer') if self.models and label == 'worker' else label
-
-    def activate_model(self, label, step, total, early=False, next_model=None):
-        if self.active_model and self.active_model != label:
-            self.finish(self.active_model, 'waiting', 'Waiting for next turn')
-        self.active_model = label
-        self.cycle = ('Expert on demand' if step is None else f'Step {step}/{total}') + (' (recovery)' if early else '')
-        if next_model:
-            self.cycle += ' | Next: '+next_model
-        self.update(label, activity='Preparing request')
-
-    def record_usage(self, label, entry):
-        label = self.resolve_label(label)
-        if label not in self.states:
-            self.update(label)
-        self.states[label].update(calls=entry.get('api_calls',0),
-            input_tokens=entry.get('prompt_tokens',0),
-            output_tokens=entry.get('output_budget_tokens',entry.get('completion_tokens',0)),
-            estimated=entry.get('output_budget_estimated',False))
-
-    @staticmethod
-    def clean(value, limit=240):
-        text = ' '.join(''.join(c if c.isprintable() else ' ' for c in str(value)).split())
-        return text if len(text) <= limit else text[:limit-3] + '...'
-
-    @classmethod
-    def describe_tool(cls, name, args):
-        detail = args.get('path', '')
-        if name == 'read_file':
-            detail += f":{args.get('start_line', 1)}-{args.get('end_line', 'end')}"
-        elif name in {'search_text', 'search_regex'}:
-            detail = f"{detail or '.'} | {args.get('query', args.get('pattern', ''))}"
-        elif name == 'run_check':
-            detail = args.get('name', '')
-        elif name == 'run_command':
-            detail = ' '.join(args.get('argv',[]))
-        elif name == 'finish_task':
-            detail = args.get('id','')
-        elif name == 'set_plan':
-            detail = f"{len(args.get('tasks',[]))} tasks"
-        elif name == 'git_show':
-            detail = f"{args.get('revision', '')} {detail}"
-        elif name == 'git_create_branch':
-            detail = args.get('name', '')
-        elif name == 'create_commit':
-            detail = args.get('message', '')
-        return cls.clean(f'{name} {detail}'.strip())
-
-    def action(self, label, message, failed=False):
-        label = self.models.get(self.resolve_label(label), label)
-        stamp = datetime.now().strftime('%H:%M:%S')
-        self.console.print(Text(f'{stamp} [{label}] {self.clean(message, 650)}',
-                                style='red' if failed else None))
-
-    def tool_finished(self, label, name, args, output, duration):
-        value = output.get('result', {})
-        failed = not output['ok'] or (name in {'run_check','run_command'} and not value.get('passed', False))
-        if not output['ok']:
-            detail = f"{output.get('error')}: {output.get('message', '')}"
-        elif name in {'run_check','run_command'}:
-            detail = f"{'PASS' if value.get('passed') else 'FAIL'} (exit={value.get('returncode')})"
-        elif name in EDIT_TOOL_NAMES:
-            detail = f"changed {', '.join(value.get('files', []))}"
-            memory=value.get('interface_memory')
-            if memory:
-                detail += f"; interfaces {'updated' if memory.get('updated') else 'NOT updated'}"
-                detail += f"; notes saved={memory.get('notes_saved',0)}, stale={memory.get('notes_stale',0)}"
-        elif name == 'read_file':
-            detail = f"lines {value.get('returned_start_line')}-{value.get('returned_end_line')}"
-        elif name == 'list_files':
-            detail = f"{value.get('entries', 0)} entries"
-        elif name in {'search_text', 'search_regex'}:
-            detail = f"{value.get('matches_returned', 0)} matches"
-        else:
-            detail = 'OK'
-        self.action(label, f'{self.describe_tool(name, args)} -> {detail} ({duration:.2f}s)', failed)
-        diagnostic = output.get('diagnostic') or output.get('output') or value.get('output')
-        if failed and diagnostic:
-            # Keep the actual final traceback, with literal terminal text.
-            self.console.print(Text(''.join(c for c in str(diagnostic)[-3000:]
-                                           if c.isprintable() or c in '\n\t'), style='red'))
-        self.update(label, activity=f'{self.describe_tool(name,args)} -> {detail}')
-
-    def render(self):
-        title = self.title + (f' | {self.cycle}' if self.cycle else '')
-        table = Table(title=Text(title), box=box.ASCII, expand=True,
-                      header_style="bold cyan", border_style="bright_black")
-        table.add_column("Model", style="bold", no_wrap=True)
-        table.add_column("Status", no_wrap=True)
-        table.add_column("Doing now")
-        table.add_column("Time", justify="right", no_wrap=True)
-        table.add_column("Calls", justify="right", no_wrap=True)
-        table.add_column("Input", justify="right", no_wrap=True)
-        table.add_column("Output", justify="right", no_wrap=True)
-        table.add_column("Spent", justify="right", no_wrap=True,
-                         style="bright_green")
-        total_cost = 0.0
-        known_costs = False
-        total_calls = total_input = 0
-        def compact_tokens(value):
-            return (f"{value / 1000:.1f}".rstrip('0').rstrip('.') + 'k') if value >= 1000 else str(value)
-        for label, state in self.states.items():
-            prefix = "  +-- " if state["depth"] else ""
-            elapsed = state.get("duration")
-            if elapsed is None:
-                elapsed = state.get('accumulated',0) + time.monotonic() - state["started"]
-            status = state["status"]
-            status_style = {"running": "yellow", "done": "green",
-                            "partial": "yellow", "failed": "red"}.get(status, "white")
-            cost = state.get("cost")
-            if cost is None:
-                cost_text = "-"
-            else:
-                cost_text = f"${cost:.5f}"
-                if state.get('estimated'):
-                    cost_text = '~'+cost_text
-                total_cost += cost
-                known_costs = True
-            calls = state.get('calls',0)
-            total_calls += calls
-            total_input += state.get('input_tokens',0)
-            output = compact_tokens(state.get('output_tokens',0))
-            if state.get('estimated'):
-                output = '~'+output
-            display_status = 'working' if status == 'running' else status
-            table.add_row(Text(prefix + self.models.get(label,label)), f"[{status_style}]{display_status}[/{status_style}]",
-                          Text(state["activity"]), f"{elapsed:.1f}s", str(calls),
-                          compact_tokens(state.get('input_tokens',0)), output, cost_text)
-        if self.states:
-            table.add_section()
-            tokens = f"{compact_tokens(self.output_used)}/{compact_tokens(self.output_limit)}"
-            if self.output_estimated:
-                tokens = '~'+tokens
-            table.add_row("TOTAL", "", "Output budget (incl. reasoning)", "", str(total_calls),
-                          compact_tokens(total_input), tokens,
-                          f"${total_cost:.5f}" if known_costs else "-")
-        return table
-
-    def update_output_budget(self, used, limit, estimated=False):
-        self.output_used = used
-        self.output_limit = limit
-        self.output_estimated = estimated
-        if self.live:
-            self.live.update(self.render(), refresh=True)
-
-    def start(self, turn_id, topic, output_limit=20000):
-        self.states = {}
-        self.output_used = 0
-        self.output_limit = output_limit
-        self.output_estimated = False
-        self.active_model = None
-        self.cycle = ''
-        self.title = f"Orchestra | {topic}"
-        for label in self.models:
-            self.update(label, status='waiting', activity='Not called yet')
-            self.states[label]['duration'] = 0
-        self.live = Live(get_renderable=self.render, console=self.console, refresh_per_second=4,
-                         transient=False)
-        self.live.start()
-
-    def stop(self):
-        if self.live:
-            self.live.update(self.render(), refresh=False)
-            self.live.stop()
-            self.live = None
-
-    def update(self, label, depth=0, activity="waiting", chunks=0,
-               status="running", cost=None):
-        label = self.resolve_label(label)
-        state = self.states.setdefault(label, {
-            "depth": depth, "started": time.monotonic(), "duration": None,
-            "status": "running", "activity": "starting", "chunks": 0,
-            "cost": None,
-            "accumulated": 0,
-        })
-        if state["status"] != "running" and status == "running":
-            state["started"] = time.monotonic()
-            state["duration"] = None
-        state.update(depth=depth, activity=activity, chunks=chunks, status=status)
-        if cost is not None:
-            state["cost"] = cost
-        if self.live:
-            self.live.update(self.render(), refresh=True)
-
-    def finish(self, label, status="done", activity="completed"):
-        if self.models and label == 'worker':
-            for model_label in self.models:
-                active = model_label == self.active_model
-                self.finish(model_label, status if active else 'done',
-                            activity if active else 'Turn finished')
-            return
-        label = self.resolve_label(label)
-        state = self.states.get(label)
-        if not state:
-            return
-        if state['status'] == 'running':
-            state['accumulated'] = state.get('accumulated',0) + time.monotonic() - state['started']
-        state["duration"] = state.get('accumulated',0)
-        state["status"] = status
-        state["activity"] = activity
-        if self.live:
-            self.live.update(self.render(), refresh=True)
-
-
-class TurnTrace:
-    """A readable execution tree plus detailed provider events for one user turn."""
-
-    def __init__(self, base, user_input, workspace):
-        stamp = datetime.now(timezone.utc)
-        self.turn_id = f"turn_{stamp.strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
-        self.topic = self.make_topic(user_input)
-        self.topic_slug = self.make_slug(self.topic)
-        self.directory = base / stamp.date().isoformat() / f"{self.turn_id}__{self.topic_slug}"
-        self.directory.mkdir(parents=True, exist_ok=False)
-        self.started_at = time.monotonic()
-        self.started = utc_now()
-        self.user_input = self.preview(user_input)
-        self.workspace = str(workspace)
-        self.events = []
-        self.tasks = {}
-        self.root_task_id = None
-        self.status = "running"
-        self.error_type = None
-        self.error_message = None
-
-    @staticmethod
-    def preview(value, limit=500):
-        value = " ".join(value.split())
-        return value if len(value) <= limit else value[:limit - 1] + "â€¦"
-
-    @classmethod
-    def make_topic(cls, value, limit=80):
-        text = cls.preview(value, limit=limit * 2)
-        first_sentence = re.split(r"[.!?\n]", text, maxsplit=1)[0].strip()
-        words = first_sentence.split()[:10]
-        topic = " ".join(words) or "untitled request"
-        return topic if len(topic) <= limit else topic[:limit - 1].rstrip() + "â€¦"
-
-    @staticmethod
-    def make_slug(topic, limit=60):
-        slug = re.sub(r"[^\w-]+", "_", topic.lower(), flags=re.UNICODE)
-        slug = re.sub(r"_+", "_", slug).strip("_-")
-        return (slug[:limit].rstrip("_-") or "untitled")
-
-    @staticmethod
-    def new_id(prefix):
-        return f"{prefix}_{uuid.uuid4().hex[:10]}"
-
-    def write_json(self, name, value):
-        path = self.directory / name
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n",
-                             encoding="utf-8")
-        temporary.replace(path)
-
-    def event(self, event_type, **details):
-        self.events.append({"time": utc_now(), "event": event_type, **details})
-        self.write_json("events.json", self.events)
-
-    def start_task(self, agent, description, parent_task_id=None):
-        task_id = self.new_id("task")
-        depth = self.tasks[parent_task_id]["depth"] + 1 if parent_task_id else 0
-        self.tasks[task_id] = {
-            "task_id": task_id,
-            "parent_task_id": parent_task_id,
-            "agent": agent,
-            "description": self.preview(description),
-            "status": "running",
-            "started_at": utc_now(),
-            "duration_seconds": None,
-            "usage": {"api_calls": 0, "prompt_tokens": 0,
-                      "completion_tokens": 0, "total_tokens": 0},
-            "metrics": {"tool_calls": 0, "tool_failures": 0,
-                        "read_file_calls": 0, "lines_read": 0,
-                        "characters_read": 0, "list_files_calls": 0,
-                        "entries_listed": 0, "search_text_calls": 0,
-                        "files_searched": 0, "matches_returned": 0,
-                        "delegations": 0},
-            "children": [],
-            "depth": depth,
-            "_started": time.monotonic(),
-        }
-        if parent_task_id:
-            self.tasks[parent_task_id]["children"].append(task_id)
-        else:
-            self.root_task_id = task_id
-        self.event("task_started", task_id=task_id,
-                   parent_task_id=parent_task_id, agent=agent,
-                   description=self.tasks[task_id]["description"])
-        self.flush_summary()
-        return task_id
-
-    def finish_task(self, task_id, status, error_type=None):
-        task = self.tasks[task_id]
-        task["status"] = status
-        task["duration_seconds"] = round(time.monotonic() - task["_started"], 1)
-        if error_type:
-            task["error_type"] = error_type
-        self.event("task_finished", task_id=task_id, status=status,
-                   duration_seconds=task["duration_seconds"], error_type=error_type)
-        self.flush_summary()
-
-    def record_request(self, task_id, request_id, provider_response_id, provider,
-                       requested_model, actual_model, duration, finish_reason,
-                       usage, error_type, request_metrics, response_metrics):
-        task_usage = self.tasks[task_id]["usage"]
-        task_usage["api_calls"] += 1
-        if usage:
-            for source, target in (("prompt_tokens", "prompt_tokens"),
-                                   ("completion_tokens", "completion_tokens"),
-                                   ("total_tokens", "total_tokens")):
-                task_usage[target] += usage.get(source, 0) or 0
-        self.event("model_request_finished", task_id=task_id,
-                   request_id=request_id,
-                   provider_response_id=provider_response_id,
-                   provider=provider, requested_model=requested_model,
-                   actual_model=actual_model,
-                   duration_seconds=round(duration, 1),
-                   finish_reason=finish_reason, usage=usage,
-                   request=request_metrics, response=response_metrics,
-                   error_type=error_type)
-        self.flush_summary()
-
-    def record_tool(self, task_id, agent, tool_event_id, provider_tool_call_id,
-                    name, arguments, duration, ok, result_summary=None,
-                    error_type=None):
-        metrics = self.tasks[task_id]["metrics"]
-        metrics["tool_calls"] += 1
-        if not ok:
-            metrics["tool_failures"] += 1
-        elif name == "read_file":
-            metrics["read_file_calls"] += 1
-            metrics["lines_read"] += result_summary.get("returned_lines", 0)
-            metrics["characters_read"] += result_summary.get("returned_characters", 0)
-        elif name == "list_files":
-            metrics["list_files_calls"] += 1
-            metrics["entries_listed"] += result_summary.get("returned_entries", 0)
-        elif name == "search_text":
-            metrics["search_text_calls"] += 1
-            metrics["files_searched"] += result_summary.get("files_scanned", 0)
-            metrics["matches_returned"] += result_summary.get("matches_returned", 0)
-        elif name == "delegate_task":
-            metrics["delegations"] += 1
-        self.event("tool_finished", task_id=task_id, agent=agent,
-                   tool_event_id=tool_event_id,
-                   provider_tool_call_id=provider_tool_call_id,
-                   tool=name, arguments=arguments, ok=ok,
-                   duration_seconds=round(duration, 3),
-                   result=result_summary, error_type=error_type)
-        self.flush_summary()
-
-    def save_final_answer(self, answer):
-        (self.directory / "answer.md").write_text(answer.rstrip() + "\n",
-                                                   encoding="utf-8")
-        self.event("answer_saved", characters=len(answer), file="answer.md")
-        self.flush_summary()
-
-    def task_tree(self, task_id):
-        source = self.tasks[task_id]
-        task = {key: value for key, value in source.items()
-                if key not in {"children", "depth", "_started"}}
-        task["children"] = [self.task_tree(child) for child in source["children"]]
-        return task
-
-    def flush_summary(self):
-        totals = {"api_calls": 0, "prompt_tokens": 0,
-                  "completion_tokens": 0, "total_tokens": 0}
-        for task in self.tasks.values():
-            for name in totals:
-                totals[name] += task["usage"][name]
-        summary = {
-            "turn_id": self.turn_id,
-            "status": self.status,
-            "started_at": self.started,
-            "duration_seconds": round(time.monotonic() - self.started_at, 1),
-            "topic": self.topic,
-            "request": self.user_input,
-            "workspace": self.workspace,
-            "usage": totals,
-            "answer_file": "answer.md" if (self.directory / "answer.md").exists() else None,
-            "root_task": self.task_tree(self.root_task_id) if self.root_task_id else None,
-        }
-        if self.error_type:
-            summary["error_type"] = self.error_type
-        if self.error_message:
-            summary["error_message"] = self.error_message
-        self.write_json("summary.json", summary)
-
-    def finish(self, status, error_type=None):
-        self.status = status
-        self.error_type = error_type
-        self.event("turn_finished", turn_id=self.turn_id, status=status,
-                   duration_seconds=round(time.monotonic() - self.started_at, 1),
-                   error_type=error_type)
-        self.flush_summary()
-
-
 class Orchestra:
-    def __init__(self, config, workspace, settings, prompts, pricing):
+    def __init__(self, config, workspace, settings, prompts, pricing, *, dashboard=None):
         self.config = config
         self.settings = settings
         self.prompts = prompts
@@ -535,15 +108,14 @@ class Orchestra:
         self.role_settings("worker")
         if settings.get('reasoning_effort','low') not in {'none','low','medium','high','xhigh','max'}:
             raise ValueError('Unsupported Luna reasoning_effort.')
-        self.files = ProjectTools(workspace)
-        checks = {name: [sys.executable if arg == '{python}' else arg for arg in argv]
-                  for name, argv in settings.get('checks', {}).items()}
-        self.repository = RepositoryTools(workspace, policy=self.files.policy, checks=checks,
-            git_enabled=settings.get('tools', {}).get('git_tools_enabled', False))
+        self.files, self.repository = workspace_tools(workspace, settings)
         self.project_map = self.repository.interface_map
-        self.repository.interface_memory_enabled = settings['execution'].get('project_map_enabled',True)
         self.clients = {}
-        self.dashboard = AgentDashboard()
+        if dashboard is None:
+            from orchestra_console import AgentDashboard
+
+            dashboard = AgentDashboard()
+        self.dashboard = dashboard
         self.logs_path = BASE / "logs"
         self.logs_path.mkdir(exist_ok=True)
         self.session_state=SessionState(self.logs_path,self.files.root)
@@ -641,39 +213,9 @@ class Orchestra:
         return {"result_type": type(result).__name__}
 
     def print_usage_summary(self, turn_usage):
-        if not turn_usage:
-            print("\nToken usage: no API calls were made.")
-            return
-        print("\nToken usage for this turn:")
-        totals = {name: 0 for name in ("api_calls", "reported_calls",
-            "prompt_tokens", "completion_tokens", "total_tokens",
-            "reasoning_tokens", "cached_tokens")}
-        total_cost = 0.0
-        all_costs_known = True
-        for label, entry in turn_usage.items():
-            for name in totals:
-                totals[name] += entry[name]
-            missing = entry["api_calls"] - entry["reported_calls"]
-            suffix = f" | usage missing for {missing} call(s)" if missing else ""
-            cost = self.estimated_cost(entry)
-            if cost is None:
-                all_costs_known = False
-                cost_text = ""
-            else:
-                total_cost += cost
-                cost_text = f" | estimated=${cost:.5f}"
-            print(f"  {label} ({entry['provider']} / {entry['model']}): "
-                  f"calls={entry['api_calls']} | input={entry['prompt_tokens']} "
-                  f"(cached={entry['cached_tokens']}) | output={entry['completion_tokens']} "
-                  f"(reasoning={entry['reasoning_tokens']}) | total={entry['total_tokens']}"
-                  f"{cost_text}{suffix}")
-        missing = totals["api_calls"] - totals["reported_calls"]
-        suffix = f" | usage missing for {missing} call(s)" if missing else ""
-        total_cost_text = f" | estimated=${total_cost:.5f}" if all_costs_known else ""
-        print(f"  TOTAL: calls={totals['api_calls']} | input={totals['prompt_tokens']} "
-              f"(cached={totals['cached_tokens']}) | output={totals['completion_tokens']} "
-              f"(reasoning={totals['reasoning_tokens']}) | total={totals['total_tokens']}"
-              f"{total_cost_text}{suffix}")
+        from orchestra_console import print_usage_summary
+
+        print_usage_summary(turn_usage, self.estimated_cost)
 
     async def request(self, role, messages, tools, resource_status, turn_usage,
                       trace, task_id, label=None, force_final=False, *, max_output_tokens=None):
@@ -859,29 +401,7 @@ class Orchestra:
         return latest
 
     def available_tools(self):
-        options = self.settings.get('tools', {})
-        result = list(FILE_TOOLS)
-        for tool in GIT_TOOLS:
-            name = tool['function']['name']
-            if not options.get('git_tools_enabled', False) and name not in {'create_file','replace_text','run_check'}:
-                continue
-            if not self.repository.available and name not in WORKSPACE_TOOL_NAMES:
-                continue
-            if name in EDIT_TOOL_NAMES and not options.get('editing_enabled', True):
-                continue
-            if name == 'run_check' and not self.repository.checks:
-                continue
-            if name in {'git_log','git_show'} and not options.get('git_history_enabled',False):
-                continue
-            if name == 'prepare_commit' and not options.get('allow_git_mutations',False):
-                continue
-            if name in {'git_create_branch', 'create_commit'} and not options.get('allow_git_mutations', False):
-                continue
-            if name == 'run_check':
-                tool = copy.deepcopy(tool)
-                tool['function']['parameters']['properties']['name']['enum'] = sorted(self.repository.checks)
-            result.append(tool)
-        return compact_tools(result)
+        return available_tools(self.settings, self.repository)
 
     async def run(self, role, messages, budget, turn_usage, trace, task_id,
                   max_delegations=0, max_calls=None, label=None):
@@ -892,7 +412,7 @@ class Orchestra:
         definitions = {t['function']['name']: t for t in tools}
         call_limit = min(max_calls or self.settings['execution']['max_steps_per_agent'],
                          self.settings['execution']['max_steps_per_agent'])
-        revision, changed, checks, edit_errors = 0, set(), {}, set()
+        state = TurnState()
         recovery_attempts = 0
         recovering_length = False
         saved_draft = None
@@ -905,17 +425,8 @@ class Orchestra:
         implementation_requested = requires_implementation(messages)
 
         def result(answer, partial=False):
-            required = set(self.repository.checks)
-            passed = {name for name, (rev, ok) in checks.items() if rev == revision and ok}
-            verified = bool(required) and required <= passed or not required and 'runtime' in passed
-            check_status = ('failed' if any(rev == revision and not ok for rev, ok in checks.values())
-                            else 'passed' if verified else 'not_run_or_stale' if required else 'not_configured')
-            return {'answer': answer or 'No answer text received.',
-                    'status': 'partial' if partial or edit_errors or check_status == 'failed'
-                              or (changed and not verified and getattr(self, 'require_checks_for_completion', True)) else 'completed',
-                    'modified_files': sorted(changed),
-                    'verification': {'status': check_status, 'revision': revision,
-                        'checks': {name: {'revision': rev, 'passed': ok} for name, (rev, ok) in checks.items()}}}
+            return state.result(answer, self.repository.checks, partial=partial,
+                                require_checks=getattr(self, 'require_checks_for_completion', True))
 
         direct = getattr(self, 'direct_mode', False)
         for step in range(call_limit):
@@ -934,7 +445,7 @@ class Orchestra:
             force_final = step == call_limit - 1 or budget['calls'] == 1 or output_remaining <= final_reserve+getattr(self,'min_working_output_tokens',0)
             research_limit = self.settings['execution'].get('research_calls_before_action', 4)
             reserve = self.settings['execution'].get('implementation_calls_reserve', 4)
-            stalled = implementation_requested and not changed
+            stalled = implementation_requested and not state.changed
             warning = None
             if stalled and not force_final:
                 if not research_warning_sent and step >= research_limit:
@@ -1010,7 +521,7 @@ class Orchestra:
                                'Continue by inspecting current files and the last recorded checks.')
                 messages.append({'role':'assistant','content':explanation})
                 trace.event('request_timeout_partial',task_id=task_id,
-                            modified_files=sorted(changed),verification=result('')['verification'])
+                            modified_files=sorted(state.changed),verification=result('')['verification'])
                 self.dashboard.action(label,explanation,failed=True)
                 outcome=result(explanation,partial=True)
                 outcome['stop_reason']='request_timeout'
@@ -1099,7 +610,7 @@ class Orchestra:
                          (isinstance(report.get('next_steps'), list) and
                           all(isinstance(item, str) for item in report['next_steps']))))
                 if continuing:
-                    signature = (revision, tuple(sorted(checks.items())))
+                    signature = (state.revision, tuple(sorted(state.checks.items())))
                     continuation_repeats = continuation_repeats + 1 if signature == continuation_signature else 1
                     continuation_signature = signature
                     output_used_now = sum(entry.get('output_budget_tokens', entry.get('completion_tokens', 0))
@@ -1123,11 +634,11 @@ class Orchestra:
                                               else 'output_budget' if output_used_now >= output_ceiling
                                               else 'call_limit' if force_final else 'report_budget_boundary')
                     return outcome
-                no_progress = implementation_requested and not changed and not checks and not blocker
+                no_progress = implementation_requested and not state.changed and not state.checks and not blocker
                 unverified_edit = (getattr(self, 'direct_mode', False)
                     and self.requires_launch_verification() and not blocker and isinstance(report, dict)
                     and report.get('done') is True
-                    and checks.get('runtime') != (revision, True))
+                    and state.checks.get('runtime') != (state.revision, True))
                 if internal or no_progress or unverified_edit:
                     trace.event('premature_completion_rejected', task_id=task_id,
                                 internal_report=internal, no_progress=no_progress, unverified_edit=unverified_edit,
@@ -1196,10 +707,9 @@ class Orchestra:
                     self.dashboard.update(label, trace.tasks[task_id]['depth'],
                                           self.dashboard.describe_tool(name, args))
                     self.dashboard.action(label, 'Starting ' + self.dashboard.describe_tool(name, args))
-                    if name == 'create_commit' and (not self.repository.checks or
-                            any(checks.get(key) != (revision, True) for key in self.repository.checks)):
+                    if name == 'create_commit' and not state.can_commit(self.repository.checks):
                         raise ToolError('verification_required', 'Run every configured check successfully after the latest edit before committing.')
-                    handler = self.repository if name in GIT_TOOL_NAMES else self.files
+                    handler = tool_handler(name, self.files, self.repository)
                     execute=getattr(self,'execute_tool',handler.execute)
                     operation = asyncio.create_task(asyncio.to_thread(execute, name, args))
                     try:
@@ -1209,17 +719,7 @@ class Orchestra:
                         # awaiting coroutine. Settle it before exiting the turn.
                         await operation
                         raise
-                    if name in EDIT_TOOL_NAMES and value.get('applied'):
-                        revision += 1
-                        changed.update(value.get('files', []))
-                        edit_errors.difference_update(value.get('files', []))
-                        edit_errors.discard('*')
-                    if name == 'run_check':
-                        checks[args['name']] = (revision, value['passed'])
-                    elif name == 'run_command' and value.get('qualifies_as_verification'):
-                        checks['runtime'] = (revision, True)
-                    elif name == 'run_command' and value.get('passed') is False:
-                        checks['runtime'] = (revision, False)
+                    state.record_result(name, args, value)
                     summary = self.tool_result_summary(name, value)
                     if name in EDIT_TOOL_NAMES:
                         summary = {key: value.get(key) for key in ('applied', 'files', 'files_changed', 'warnings', 'interface_memory')}
@@ -1233,21 +733,11 @@ class Orchestra:
                     output = {'ok': True, 'result': model_result(name, value)}
                 except ToolError as error:
                     error_code = error.code
-                    if name in EDIT_TOOL_NAMES:
-                        edit_errors.add(args.get('path', '*'))
-                    if name == 'run_check' and args.get('name') in self.repository.checks:
-                        checks[args['name']] = (revision, False)
-                    elif name == 'run_command':
-                        checks['runtime'] = (revision, False)
+                    state.record_failure(name, args, self.repository.checks)
                     output = {'ok': False, 'error': error.code, 'message': str(error), **error.details}
                 except Exception as error:
                     error_code = type(error).__name__
-                    if name in EDIT_TOOL_NAMES:
-                        edit_errors.add(args.get('path', '*'))
-                    if name == 'run_check' and args.get('name') in self.repository.checks:
-                        checks[args['name']] = (revision, False)
-                    elif name == 'run_command':
-                        checks['runtime'] = (revision, False)
+                    state.record_failure(name, args, self.repository.checks)
                     output = {'ok': False, 'error': 'internal_tool_error',
                               'message': error_description(error) + ' Inspect current files before retrying.'}
                 duration = time.monotonic() - started
@@ -1268,11 +758,11 @@ class Orchestra:
                 trace.error_message = None
                 messages.append({'role':'system','content':length_notice})
                 trace.event('output_limit_prefix_settled',task_id=task_id,
-                            modified_files=sorted(changed),verification=result('')['verification'])
+                            modified_files=sorted(state.changed),verification=result('')['verification'])
                 if length_stop_after_tools:
                     outcome=result((saved_draft + '\n' if saved_draft else '') +
                         'Output/call budget boundary reached. Complete calls were processed; unfinished tail discarded. '
-                        'Saved changes: ' + ', '.join(sorted(changed)),partial=True)
+                        'Saved changes: ' + ', '.join(sorted(state.changed)),partial=True)
                     outcome['stop_reason']='call_limit' if direct else 'output_limit'
                     return outcome
         outcome = result('Call budget exhausted. Inspect saved changes and verification results before continuing.', partial=True)
@@ -1351,105 +841,17 @@ def validate_prompts(prompts):
 
 
 async def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--workspace", type=Path, default=BASE / "workspace")
-    args = parser.parse_args()
-    with (BASE / "config.local.json").open(encoding="utf-8") as file:
-        config = json.load(file)
-    with (BASE / "settings.json").open(encoding="utf-8") as file:
-        runtime_settings = json.load(file)
-    with (BASE / "prompts.json").open(encoding="utf-8") as file:
-        prompts = json.load(file)
-    with (BASE / "pricing.json").open(encoding="utf-8") as file:
-        pricing = json.load(file)
-    if args.workspace == BASE / "workspace":
-        args.workspace.mkdir(exist_ok=True)
-    from direct_dev import DirectDevelopment as Pipeline
-    app = Pipeline(config, args.workspace, runtime_settings, prompts, pricing)
-    print(f"Pipeline workspace: {app.files.root}")
-    for role in ("writer", "strong"):
-        settings = app.role_settings(role)
-        print(f"{role}: {settings['provider']} / {settings['model']}")
-    from autodev_console import brief, input_command
-    while True:
-        print('\n'+brief(app))
-        try:
-            text = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        command,payload=input_command(text)
-        if command == 'exit':
-            break
-        if command == 'status':
-            continue
-        if command == 'new' and not payload:
-            try:
-                payload=input('New task: ').strip()
-            except (EOFError,KeyboardInterrupt):
-                break
-            if not payload:continue
-            text='N: '+payload
-        if not text:
-            continue
-        suggestion=SessionState.layout_suggestion(text)
-        if suggestion:
-            print('Похоже, включена неверная раскладка. Предполагаемый текст:')
-            print(suggestion)
-            try:
-                accepted=input('Использовать этот текст? [y/да, иначе введи заново]: ').strip().lower()
-            except (EOFError,KeyboardInterrupt):
-                break
-            if accepted not in {'y','yes','д','да'}:
-                print('Задание не отправлено в API.')
-                continue
-            text=suggestion
-        turn_usage = {}
-        trace = TurnTrace(app.logs_path, text, app.files.root)
-        root_task_id = trace.start_task("worker", text)
-        app.dashboard.start(trace.turn_id, trace.topic,
-                            output_limit=app.total_output_limit)
-        turn_status = "failed"
-        turn_error = None
-        try:
-            worker_result = await app.run_user_task(text, turn_usage, trace, root_task_id)
-            trace.event('workspace_result', modified_files=worker_result['modified_files'],
-                        verification=worker_result['verification'],
-                        chain_state=worker_result.get('chain_state'),
-                        blocker=worker_result.get('blocker'),
-                        iterations=worker_result.get('iterations'))
-            answer = worker_result["answer"]
-            result_status = worker_result["status"]
-            trace.save_final_answer(answer)
-            trace.finish_task(root_task_id, result_status)
-            activity = "Work incomplete; see report" if result_status == "partial" else "Task completed"
-            dashboard_status = "partial" if result_status == "partial" else "done"
-            app.dashboard.finish("worker", dashboard_status, activity)
-            app.dashboard.stop()
-            turn_status = result_status
-            print(f"\nAssistant:\n{answer}")
-            if result_status == "partial":
-                print("\n[Partial result: inspect reported gaps and verification in the log.]")
-        except Exception as error:
-            turn_error = type(error).__name__
-            description = error_description(error)
-            trace.error_message = description
-            trace.event('turn_error', error_type=turn_error, message=description)
-            app.dashboard.finish("worker", "failed", turn_error)
-            app.dashboard.stop()
-            trace.finish_task(root_task_id, "failed", turn_error)
-            print(f"Turn failed ({turn_error}): {description}\nLocal file changes were NOT rolled back.")
-        except KeyboardInterrupt:
-            turn_status = "cancelled"
-            turn_error = "KeyboardInterrupt"
-            app.dashboard.finish("worker", "failed", "cancelled")
-            app.dashboard.stop()
-            trace.finish_task(root_task_id, "cancelled", turn_error)
-            print("\nTurn cancelled. Local file changes were NOT rolled back.")
-        finally:
-            app.dashboard.stop()
-            trace.finish(turn_status, turn_error)
-            app.print_usage_summary(turn_usage)
-            print(f"  Log: {trace.directory}")
+    from orchestra_cli import main as run_console
+
+    await run_console(BASE)
+
+
+def __getattr__(name):
+    if name == 'AgentDashboard':
+        from orchestra_console import AgentDashboard
+
+        return AgentDashboard
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":

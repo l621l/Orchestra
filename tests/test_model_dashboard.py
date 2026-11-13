@@ -2,7 +2,7 @@ import io
 import unittest
 from unittest.mock import patch
 from rich.console import Console
-from orchestra import AgentDashboard
+from orchestra_console import AgentDashboard
 
 
 class ModelDashboard(unittest.TestCase):
@@ -45,7 +45,7 @@ class ModelDashboard(unittest.TestCase):
         self.assertEqual(self.dashboard.states['strong']['status'],'partial')
 
     def test_two_models_and_budget_are_readable(self):
-        with patch('orchestra.Live'):
+        with patch('orchestra_console.Live'):
             self.dashboard.start('turn','Build game')
         self.dashboard.activate_model('writer',1,6,next_model='mimo-v2.6-pro')
         self.dashboard.update_output_budget(416,20000)
@@ -58,13 +58,13 @@ class ModelDashboard(unittest.TestCase):
         self.assertNotIn('worker',text)
 
     def test_elapsed_time_accumulates_only_active_segments(self):
-        with patch('orchestra.time.monotonic',return_value=10):
+        with patch('orchestra_console.time.monotonic',return_value=10):
             self.dashboard.activate_model('writer',1,6)
-        with patch('orchestra.time.monotonic',return_value=20):
+        with patch('orchestra_console.time.monotonic',return_value=20):
             self.dashboard.activate_model('strong',6,6)
-        with patch('orchestra.time.monotonic',return_value=50):
+        with patch('orchestra_console.time.monotonic',return_value=50):
             self.dashboard.activate_model('writer',1,6)
-        with patch('orchestra.time.monotonic',return_value=55):
+        with patch('orchestra_console.time.monotonic',return_value=55):
             self.dashboard.finish('worker')
         self.assertEqual(self.dashboard.states['writer']['duration'],15)
         self.assertEqual(self.dashboard.states['strong']['duration'],30)
