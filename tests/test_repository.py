@@ -31,6 +31,41 @@ class RepositoryReliability(unittest.TestCase):
         self.git('add', '.')
         self.git('commit', '-qm', 'test snapshot')
 
+    def test_push_publishes_current_branch_and_sets_upstream(self):
+        self.write('file.txt', 'committed content')
+        self.commit()
+        self.git('switch', '-c', 'publish-test')
+        with tempfile.TemporaryDirectory() as remote:
+            subprocess.run(['git', 'init', '-q', '--bare', remote], check=True)
+            self.git('remote', 'add', 'origin', remote)
+            repo = RepositoryTools(self.root)
+            self.assertTrue(repo.execute('git_push', {})['pushed'])
+            self.assertEqual(self.git('rev-parse', '@{upstream}'), self.git('rev-parse', 'HEAD'))
+            self.assertTrue(repo.execute('git_push', {})['pushed'])
+            self.assertEqual(self.git('ls-remote', '--heads', 'origin').splitlines(),
+                             [self.git('rev-parse', 'HEAD').strip() + '\trefs/heads/publish-test'])
+
+    def test_pull_updates_from_upstream_and_rejects_dirty_worktree(self):
+        self.write('file.txt', 'before')
+        self.commit()
+        branch = self.git('branch', '--show-current').strip()
+        with tempfile.TemporaryDirectory() as upstream:
+            subprocess.run(['git', 'clone', '-q', str(self.root), upstream], check=True)
+            self.git('remote', 'add', 'origin', upstream)
+            self.git('fetch', '-q', 'origin')
+            self.git('branch', '--set-upstream-to', f'origin/{branch}')
+            (Path(upstream) / 'file.txt').write_text('after', encoding='utf-8')
+            subprocess.run(['git', '-C', upstream, '-c', 'user.name=Test',
+                            '-c', 'user.email=test@example.invalid', 'commit', '-qam', 'update'], check=True)
+            repo = RepositoryTools(self.root)
+            self.write('local.txt', 'local changes')
+            with self.assertRaisesRegex(ToolError, 'Save local changes'):
+                repo.execute('git_pull', {})
+            (self.root / 'local.txt').unlink()
+            self.assertTrue(repo.execute('git_pull', {})['updated'])
+            self.assertEqual((self.root / 'file.txt').read_text(), 'after')
+            self.assertFalse(repo.execute('git_pull', {})['updated'])
+
     def test_history_and_diff_filter_restricted_files(self):
         self.write('src/a.txt', 'public old\n')
         self.write('src/config.local.json', 'DUMMY_SECRET_OLD\n')

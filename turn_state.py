@@ -15,6 +15,8 @@ class TurnState:
         )
 
     def record_result(self, name, args, value):
+        if name == 'git_pull' and value.get('updated'):
+            self.revision += 1
         if name in EDIT_TOOL_NAMES and value.get('applied'):
             self.revision += 1
             self.changed.update(value.get('files', []))

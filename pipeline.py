@@ -1,16 +1,9 @@
 """Shared tool loop: five MiMo calls, one stronger model call."""
 import hashlib
 import json
-from orchestra import Orchestra, error_description
-
-
-def clip(text, limit):
-    text = str(text or '')
-    if len(text) <= limit:
-        return text
-    marker = '\n[omitted; read source for full details]\n'
-    room = max(0, limit-len(marker))
-    return text[:room*2//3]+marker+text[-(room-room*2//3):] if room else marker[:limit]
+from model_errors import error_description
+from orchestra import Orchestra
+from model_routing import clip, role_settings
 
 
 class Pipeline(Orchestra):
@@ -34,19 +27,7 @@ class Pipeline(Orchestra):
         self.state_path = self.logs_path / ('alternating_'+key+'.json')
 
     def role_settings(self, role):
-        role = 'writer' if role == 'worker' else role
-        if role not in {'writer', 'strong'}:
-            raise ValueError('Unsupported alternating role: '+role)
-        roles = self.config.get('roles', {})
-        config = roles.get(role)
-        if role == 'strong' and config is None:
-            config = roles.get('director')
-        if (not isinstance(config, dict)
-                or config.get('provider') not in self.config.get('providers', {})
-                or not isinstance(config.get('model'), str) or not config['model'].strip()
-                or config.get('transport', 'responses' if role == 'strong' else 'chat') not in {'chat', 'responses'}):
-            raise ValueError('Configure roles.'+role+' with provider, model and transport (chat/responses).')
-        return config
+        return role_settings(self.config, role)
 
     @property
     def total_output_limit(self):
@@ -172,13 +153,8 @@ class Pipeline(Orchestra):
                       task_id, label=None, force_final=False, **kwargs):
         width = self.options['writer_calls'] + self.options['strong_calls']
         early = self._position < self.options['writer_calls'] and self.repeated_errors(messages)
-        selector=getattr(self,'select_executor',None)
-        if selector:
-            selected,reason=selector(force_final)
-            early=selected=='strong'
-        else:
-            selected = 'strong' if early or self._position >= self.options['writer_calls'] else 'writer'
-            reason='recovery' if early else 'cycle'
+        selected = 'strong' if early or self._position >= self.options['writer_calls'] else 'writer'
+        reason = 'recovery' if early else 'cycle'
         config = self.role_settings(selected)
         transport = config.get('transport', 'responses' if selected == 'strong' else 'chat')
         if transport == 'chat':
@@ -189,10 +165,10 @@ class Pipeline(Orchestra):
                     position=self._position, early=early, model=config['model'],reason=reason)
         next_position = 0 if early else (self._position+1) % width
         next_role = 'strong' if next_position >= self.options['writer_calls'] else 'writer'
-        self.dashboard.activate_model(selected, None if selector else self.options['writer_calls']+1 if early else self._position+1,
-            width, early=early, next_model=self.role_settings('writer' if selector else next_role)['model'])
+        self.dashboard.activate_model(selected, self.options['writer_calls']+1 if early else self._position+1,
+            width, early=early, next_model=self.role_settings(next_role)['model'])
         self.dashboard.action(selected, 'Continue shared task: '+config['model'])
-        self._position = 0 if selector or early else (self._position + 1) % width
+        self._position = 0 if early else (self._position + 1) % width
         if self._state is not None:
             self.save_state()
         wire_messages = self.strong_context(messages) if selected == 'strong' else messages

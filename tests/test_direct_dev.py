@@ -1,4 +1,6 @@
 import copy,json,unittest
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock,patch
 from tests import test_autodev as fixtures
@@ -8,6 +10,163 @@ from autodev_console import brief
 
 class DirectLoop(unittest.IsolatedAsyncioTestCase):
     call=fixtures.AutoDevelopment.call
+
+    async def test_sol_preserves_history_after_successful_commit(self):
+        self.app.config['roles']['writer'] = {
+            'provider': 'gpt', 'model': 'gpt-6.1-sol', 'transport': 'responses',
+        }
+        self.app.load_or_start('Implement project')
+        messages = self.app._state['messages']
+        for index, name in enumerate(('read_file', 'run_command', 'create_commit')):
+            call_id = str(index)
+            messages.extend([
+                {'role': 'assistant', 'tool_calls': [{'id': call_id, 'type': 'function',
+                    'function': {'name': name, 'arguments': '{}'}}]},
+                {'role': 'tool', 'tool_call_id': call_id, 'content': '{}'},
+            ])
+        with patch.object(self.app.repository, 'execute', return_value={'committed': True}):
+            self.app.execute_tool('create_commit', {})
+        with patch('responses_transport.request', new_callable=AsyncMock):
+            await self.app.request_executor('writer', 'continuous_work', messages, [], '', {},
+                                            self.trace, self.parent, False)
+        self.assertEqual([item['tool_call_id'] for item in messages if item['role'] == 'tool'], ['0', '1', '2'])
+        self.assertNotIn('compact_after_commit', self.app._state)
+        self.assertFalse(any(event['event'] == 'history_compacted' for event in self.trace.events))
+
+    def test_sol_bounds_new_reads_and_command_output_before_adding_them_to_history(self):
+        self.app.config['roles']['writer'] = {
+            'provider': 'gpt', 'model': 'gpt-6.1-sol', 'transport': 'responses',
+        }
+        source = {'ok': True, 'result': {
+            'content': '\n'.join(f'{i}: ' + 'x' * 200 for i in range(1, 101)),
+            'returned_start_line': 1, 'returned_end_line': 100,
+        }}
+        result = self.app.history_tool_result('read_file', {'path': 'main.py'}, source)['result']
+        self.assertEqual(result['next_start_line'], result['returned_end_line'] + 1)
+        self.assertLess(result['returned_end_line'], 100)
+        self.assertEqual(source['result']['returned_end_line'], 100)
+
+        command = {'ok': True, 'result': {'passed': False, 'output': 'x' * 5000 + 'FAILED'}}
+        result = self.app.history_tool_result('run_command', {}, command)['result']
+        self.assertFalse(result['passed'])
+        self.assertTrue(result['output'].endswith('FAILED'))
+        self.assertLess(len(result['output']), len(command['result']['output']))
+
+    async def test_responses_writer_can_drop_old_reads_without_dropping_edits(self):
+        self.app.config['roles']['writer']['transport'] = 'responses'
+        (self.root / 'old.txt').write_text('old source', encoding='utf-8')
+        self.app.request = AsyncMock(side_effect=[
+            self.call('read_file', path='old.txt'),
+            self.call('create_file', path='result.txt', content='new'),
+            self.call('compact_context', paths=['old.txt', 'result.txt']),
+            {'role': 'assistant', 'content': '{"summary":"Created","done":true,"state":"complete"}'},
+        ])
+        result = await self.app.run_user_task('Create result.txt', {}, self.trace, self.parent)
+        messages = self.app._state['messages']
+        calls = [call for item in messages for call in item.get('tool_calls', [])]
+        self.assertEqual([call['function']['name'] for call in calls],
+                         ['create_file', 'compact_context'])
+        self.assertEqual([item['tool_call_id'] for item in messages if item['role'] == 'tool'],
+                         [call['id'] for call in calls])
+        self.assertNotIn('old source', json.dumps(messages))
+        self.assertEqual(result['modified_files'], ['result.txt'])
+
+    def test_responses_history_counts_encrypted_items_and_keeps_recent_pairs(self):
+        from responses_transport import request_payload
+
+        self.app.config['roles']['writer'] = {
+            'provider': 'gpt', 'model': 'gpt-6.1-sol', 'transport': 'responses',
+        }
+        self.app.load_or_start('Develop program')
+        messages = self.app._state['messages']
+        self.app.options['writer_request_characters'] = 24000
+        tools = self.app.available_tools()
+        for index in range(3):
+            call_id = f'call_{index}'
+            messages.extend([
+                {'role': 'assistant', '_response_items': [
+                    {'type': 'reasoning', 'encrypted_content': str(index) * 6000},
+                    {'type': 'function_call', 'call_id': call_id, 'name': 'read_file', 'arguments': '{}'},
+                ]},
+                {'role': 'tool', 'tool_call_id': call_id, 'content': '{}'},
+            ])
+        self.app.fit_history(messages, tools, 'Real instructions', max_output_tokens=4096)
+        payload = request_payload(self.app, 'writer', messages, tools, 'Real instructions',
+                                  max_output_tokens=4096)
+        self.app.validate_request_input('writer', payload)
+        self.assertEqual([item['encrypted_content'] for item in payload['input']
+                          if item.get('type') == 'reasoning'], ['1' * 6000, '2' * 6000])
+        for kind in ('function_call', 'function_call_output'):
+            self.assertEqual([item['call_id'] for item in payload['input'] if item.get('type') == kind],
+                             ['call_1', 'call_2'])
+
+    @unittest.skipUnless(shutil.which('git'), 'Git is required')
+    def test_direct_exposes_and_dispatches_git_for_a_repository(self):
+        subprocess.run(['git', 'init', '-q', str(self.root)], check=True)
+        settings = copy.deepcopy(self.app.settings)
+        settings['tools'].update(git_tools_enabled=True, git_history_enabled=True,
+                                 allow_git_mutations=True)
+        app = DirectDevelopment(self.app.config, self.root, settings, self.app.prompts,
+                                self.app.pricing, logs_path=self.app.logs_path)
+        app.load_or_start('Inspect repository')
+        names = {tool['function']['name'] for tool in app.available_tools()}
+        self.assertTrue({'git_status', 'git_diff', 'git_log', 'git_show',
+                         'prepare_commit', 'create_commit'} <= names)
+        self.assertNotIn('git_create_branch', names)
+        self.assertIn('status', app.execute_tool('git_status', {}))
+
+    async def test_debug_moves_from_diagnosis_to_edit_then_verification(self):
+        self.app.settings['execution']['research_calls_before_action'] = 1
+        path = self.root / 'main.py'
+        path.write_text('print("old")\n', encoding='utf-8')
+        self.app.request = AsyncMock(side_effect=[
+            self.call('read_file', path='main.py'),
+            self.call('run_command', argv=['{python}', 'main.py']),
+            self.call('replace_text', path='main.py', old_text='old', new_text='new'),
+            self.call('run_command', argv=['{python}', 'main.py']),
+            {'role': 'assistant', 'content': 'Focused check passed.\n\n```json\n'
+             '{"summary":"Fixed","done":true,"state":"complete"}\n```'},
+        ])
+        result = await self.app.run_user_task('D: Fix the wrong output', {}, self.trace, self.parent)
+        requests = self.app.request.call_args_list
+        for request in requests[1:3]:
+            self.assertEqual({tool['function']['name'] for tool in request.args[2]},
+                             {'create_file', 'replace_text'})
+        self.assertIn('run_command', {tool['function']['name'] for tool in requests[3].args[2]})
+        self.assertEqual(path.read_text(encoding='utf-8'), 'print("new")\n')
+        self.assertEqual(result['verification']['status'], 'passed')
+        self.assertEqual(result['status'], 'completed')
+
+    async def test_debug_can_create_missing_gitignore_at_edit_step(self):
+        self.app.settings['execution']['research_calls_before_action'] = 1
+        self.app.request = AsyncMock(side_effect=[
+            self.call('list_files', path='.'),
+            self.call('create_file', path='.gitignore', content='__pycache__/\n'),
+            {'role': 'assistant', 'content': '{"summary":"Created ignore file","done":false,"state":"needs_user","blocker":{"action":"Review","reason":"Review requested","evidence":"File created"}}'},
+        ])
+        result = await self.app.run_user_task('D: Add missing .gitignore', {}, self.trace, self.parent)
+        self.assertEqual((self.root / '.gitignore').read_text(), '__pycache__/\n')
+        self.assertEqual(result['modified_files'], ['.gitignore'])
+
+    async def test_debug_moves_to_focused_check_after_full_suite_failure(self):
+        (self.root / 'main.py').write_text('value = "old"\n', encoding='utf-8')
+        (self.root / 'suite.py').write_text('import main\nraise SystemExit(1)\n', encoding='utf-8')
+        full = ['{python}', 'suite.py']
+        focused = ['{python}', '-c', 'import main; assert main.value == "new"']
+        self.app.request = AsyncMock(side_effect=[
+            self.call('replace_text', path='main.py', old_text='old', new_text='new'),
+            self.call('run_command', argv=full),
+            self.call('run_command', argv=full),
+            self.call('run_command', argv=focused),
+            {'role': 'assistant', 'content': '{"summary":"Focused check passed; suite failed","done":true,"state":"complete"}'},
+        ])
+        result = await self.app.run_user_task('D: Fix the wrong value', {}, self.trace, self.parent)
+        checks = [event for event in self.trace.events if event.get('tool') == 'run_command']
+        self.assertFalse(checks[0]['result']['passed'])
+        self.assertEqual(checks[1]['error_type'], 'debug_check_already_failed')
+        self.assertTrue(checks[2]['result']['passed'])
+        self.assertEqual(result['verification']['status'], 'passed')
+        self.assertEqual(result['status'], 'completed')
     def setUp(self):
         import tempfile
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);self.root=Path(tmp.name)
@@ -28,7 +187,17 @@ class DirectLoop(unittest.IsolatedAsyncioTestCase):
         self.app.execute_tool('create_file',{'path':'main.py','content':source})
         result=self.app.execute_tool('read_file',{'path':'main.py'})
         self.assertEqual(result['returned_end_line'],200)
-        self.assertFalse(self.app.requires_plan_call())
+        self.assertFalse(hasattr(self.app, 'requires_plan_call'))
+
+    def test_direct_mode_works_without_alternation_settings(self):
+        settings = copy.deepcopy(self.app.settings)
+        for key in ('writer_calls', 'strong_calls', 'early_error_threshold', 'planning_attempt_limit'):
+            settings['pipeline'].pop(key, None)
+        engine = DirectDevelopment(self.app.config, self.root, settings, self.app.prompts,
+                                   self.app.pricing, logs_path=self.app.logs_path)
+        engine.load_or_start('Build program')
+        self.assertEqual(engine.select_executor(), ('writer', 'continuous_work'))
+        self.assertNotIn('planning_calls', engine._state)
 
     async def test_first_call_can_write_then_verify_without_protocol(self):
         done={'role':'assistant','content':json.dumps({'summary':'hello works','next_steps':'','done':True,'state':'complete'})}
@@ -119,4 +288,5 @@ class DirectLoop(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(observed),10)
         self.assertIn('strong',observed)
         self.assertEqual(observed.count('strong'),1)
-        self.assertIn('No progress',result['answer'])
+        self.assertIn('Изменений нет.', result['answer'])
+        self.assertIn('без прогресса', result['stop_reason'])

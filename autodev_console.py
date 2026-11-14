@@ -1,39 +1,39 @@
-"""A small local status line; no model calls or intent classification."""
-import json
+"""A small local status line with no model calls."""
 from autodev_intent import input_command
+from workspace_status import workspace_status
 
 
-HELP='C=continue | N: <task>=new | D: <error>=debug | S=status | Q=exit | text=update current task'
+HELP = 'C=continue | N: <task>=new | D: <error>=debug | S=status | Q=exit | text=update current task'
 
 
 def brief(app):
-    if not app.state_path.is_file():
-        return '[NEW] No saved task. Type a task or use N: <task>.\n'+HELP
-    try:
-        state=json.loads(app.state_path.read_text(encoding='utf-8'))
-        if state.get('version')!=2 or state.get('workspace')!=str(app.files.root):
-            raise ValueError('Invalid checkpoint')
-        tasks=state['plan'];done=sum(t['status']=='done' for t in tasks)
-        if state.get('mode')=='direct' or getattr(app,'direct_mode',False):
-            code='DONE' if state.get('status')=='completed' else 'PAUSE'
-            mode = 'Debug' if state.get('task_kind') == 'debug' else 'Direct'
-            line = f'[{code}] {mode} | Changed files: {len(state.get("modified_files", []))} | Spent: ${state.get("budget_spent", 0):.4f}/${app.options["max_task_cost_usd"]:.2f}'
-            if state.get('stop_reason'):
-                line += ' | Stop: ' + state['stop_reason']
-            command = state.get('last_command') or {}
-            if command:
-                line += ' | Last command: ' + ('PASS' if command['passed'] else 'FAIL')
-                if command.get('revision') != state.get('revision'):
-                    line += ' (earlier revision)'
-            if state.get('verified_copy'):
-                line += '\nVerified copy: ' + state['verified_copy']['path']
-            if state.get('checkpoint_error'):
-                line += '\nCopy failed: ' + state['checkpoint_error']
-            return line + '\n' + HELP
-        code='DONE' if state.get('status')=='completed' else 'PLAN' if not tasks else 'PAUSE'
-        progress=f'{done}/{len(tasks)}' if tasks else 'no plan yet'
-        next_step='plan' if not tasks else next(('#'+str(i+1) for i,t in enumerate(tasks) if t['status']!='done'),'-')
-        cap=app.options['max_task_cost_usd']
-        return f'[{code}] Done: {progress} | Next: {next_step} | Spent: ${state.get("budget_spent",0):.4f}/${cap:.2f}\n'+HELP
-    except (OSError,ValueError,KeyError,TypeError):
-        return '[STATE_ERROR] Cannot read checkpoint. N: <task> starts new and archives it.\n'+HELP
+    return format_status(workspace_status(app))
+
+
+def format_status(state):
+    code = state['status'].upper()
+    if code == 'NEW':
+        return '[NEW] No saved task. Type a task or use N: <task>.\n' + HELP
+    if code == 'STATE_ERROR':
+        return '[STATE_ERROR] Cannot read checkpoint. N: <task> starts new and archives it.\n' + HELP
+    spent = f'${state["budget_spent"]:.4f}/${state["budget_limit"]:.2f}'
+    if state['mode'] == 'direct':
+        mode = 'Debug' if state['task_kind'] == 'debug' else 'Direct'
+        line = f'[{code}] {mode} | Changed files: {state["modified_file_count"]} | Spent: {spent}'
+        if state['stop_reason']:
+            line += ' | Stop: ' + state['stop_reason']
+        command = state['last_command']
+        if command:
+            line += ' | Last command: ' + ('PASS' if command['passed'] else 'FAIL')
+            if command['stale']:
+                line += ' (earlier revision)'
+        if state['verified_copy']:
+            line += '\nVerified copy: ' + state['verified_copy']['path']
+        if state['checkpoint_error']:
+            line += '\nCopy failed: ' + state['checkpoint_error']
+        return line + '\n' + HELP
+    count = state['total_tasks']
+    progress = f'{state["completed_tasks"]}/{count}' if count else 'no plan yet'
+    next_task = state['next_task']
+    next_step = 'plan' if not count else f'#{next_task}' if next_task else '-'
+    return f'[{code}] Done: {progress} | Next: {next_step} | Spent: {spent}\n' + HELP

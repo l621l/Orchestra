@@ -16,6 +16,7 @@ class MiMoContext(unittest.IsolatedAsyncioTestCase):
     async def test_thinking_stays_enabled_on_second_working_call_and_reasoning_round_trips(self):
         self.app.load_or_start('Develop program')
         thought='long reasoning '*400
+        self.trace.on_progress = lambda event: None
         create=AsyncMock(return_value=self.response(thought))
         self.app.clients['mimo']=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
         messages=[{'role':'user','content':'Develop program'}];usage={}
@@ -23,6 +24,7 @@ class MiMoContext(unittest.IsolatedAsyncioTestCase):
         messages.extend([result,{'role':'tool','tool_call_id':'read1','content':'{"ok":true,"result":{"content":"1: code"}}'}])
         await request(self.app,'writer',messages,self.app.available_tools(),'budget',usage,self.trace,self.parent)
         self.assertEqual([c.kwargs['extra_body']['thinking']['type'] for c in create.call_args_list],['enabled','enabled'])
+        self.assertTrue(all(not call.kwargs.get('stream', False) for call in create.call_args_list))
         assistant=next(m for m in create.call_args.kwargs['messages'] if m['role']=='assistant')
         self.assertEqual(assistant['reasoning_content'],thought)
         self.assertNotIn('_reasoning_owner',assistant)

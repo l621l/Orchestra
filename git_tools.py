@@ -17,10 +17,12 @@ from tool_contracts import EDIT_TOOL_NAMES, validate_arguments
 
 
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_log", "git_show",
-                  "git_create_branch", "run_check", "prepare_commit", "create_commit", *EDIT_TOOL_NAMES}
+                  "git_create_branch", "git_pull", "git_push", "run_check", "prepare_commit", "create_commit", *EDIT_TOOL_NAMES}
 WORKSPACE_TOOL_NAMES = {"run_check", *EDIT_TOOL_NAMES}
 
 GIT_TOOLS = [
+    definition("git_push", "Publish commits from the current branch to its upstream, or to the same branch on origin on the first push. Call alone when the user requests publication.", {}, []),
+    definition("git_pull", "Update the current branch from its configured upstream with fast-forward only. Call alone with a clean working tree.", {}, []),
     definition("create_file", "Create a new UTF-8 text file, including missing parent directories. Fails if the path already exists; never overwrites. Use replace_text for an existing file. Does not require Git or stage changes.",
                {"path": {"type": "string", "description": "New workspace-relative file path."},
                 "content": {"type": "string", "maxLength": 200000,
@@ -167,6 +169,39 @@ class RepositoryTools:
             arguments.append("--cached")
         output = self._run(arguments)["stdout"]
         return [path for path in output.split("\0") if path]
+
+    def git_push(self):
+        self._require_repository()
+        branch = self._run(['branch', '--show-current'])['stdout'].strip()
+        if not branch:
+            raise ToolError('detached_head', 'Select a local branch before pushing.')
+        remote = self._run(['config', '--get', f'branch.{branch}.remote'], check=False)['stdout'].strip()
+        target = self._run(['config', '--get', f'branch.{branch}.merge'], check=False)['stdout'].strip()
+        if bool(remote) != bool(target) or remote == '.' or (target and not target.startswith('refs/heads/')):
+            raise ToolError('invalid_upstream', 'Configure a remote branch as the upstream before pushing.')
+        destination = target or f'refs/heads/{branch}'
+        source = f'refs/heads/{branch}'
+        result = self._run(['push', '--no-follow-tags', '--set-upstream', '--',
+                            remote or 'origin', f'{source}:{destination}'], check=False)
+        if result['returncode']:
+            raise ToolError('push_failed', 'Git rejected the push. Check the remote, access, and branch history.')
+        return {'pushed': True, 'branch': branch, 'remote': remote or 'origin', 'destination': destination}
+
+    def git_pull(self):
+        self._require_repository()
+        if not self._run(['branch', '--show-current'])['stdout'].strip():
+            raise ToolError('detached_head', 'Select a local branch before pulling.')
+        upstream = self._run(['rev-parse', '--abbrev-ref', '@{upstream}'], check=False)
+        if upstream['returncode']:
+            raise ToolError('missing_upstream', 'The current branch has no configured upstream.')
+        if self._run(['status', '--porcelain', '--untracked-files=all'])['stdout']:
+            raise ToolError('dirty_worktree', 'Save local changes before pulling.')
+        before = self._run(['rev-parse', 'HEAD'])['stdout'].strip()
+        result = self._run(['pull', '--ff-only', '--no-rebase', '--no-autostash'], check=False)
+        if result['returncode']:
+            raise ToolError('pull_failed', 'Fast-forward pull failed. Check remote access and whether the branch diverged.')
+        head = self._run(['rev-parse', 'HEAD'])['stdout'].strip()
+        return {'upstream': upstream['stdout'].strip(), 'head': head, 'updated': head != before}
 
     def git_status(self):
         self._require_repository()
@@ -703,7 +738,8 @@ class RepositoryTools:
                 "diff": diff, "diff_truncated": diff_truncated, "warnings": warnings}
 
     def execute(self, name, arguments, *, check_timeout=None):
-        handlers = {"git_status": self.git_status, "git_diff": self.git_diff,
+        handlers = {"git_status": self.git_status, "git_diff": self.git_diff, "git_pull": self.git_pull,
+                    "git_push": self.git_push,
                     "git_log": self.git_log, "git_show": self.git_show,
                     "git_create_branch": self.git_create_branch,
                     "run_check": self.run_check, "apply_patch": self.apply_patch,

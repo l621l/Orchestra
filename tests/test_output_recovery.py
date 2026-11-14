@@ -22,7 +22,10 @@ class OutputRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(pool['calls'], 4)
         self.assertEqual(result['verification']['status'], 'passed')
-        self.assertEqual(self.app.request.call_args_list[1].kwargs['max_output_tokens'],self.settings['generation']['max_output_tokens'])
+        execution = self.settings['execution']
+        expected_cap = min(self.settings['generation']['max_output_tokens'],
+                           execution['max_output_tokens_per_turn'] - execution['final_output_reserve_tokens'])
+        self.assertEqual(self.app.request.call_args_list[1].kwargs['max_output_tokens'], expected_cap)
         self.assertEqual(sum(e['event']=='output_limit_recovery_started' for e in self.trace.events),1)
         self.assertIsNone(self.trace.error_message)
 

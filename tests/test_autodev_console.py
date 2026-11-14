@@ -15,7 +15,7 @@ class SimpleConsole(unittest.TestCase):
         text=brief(self.app)
         self.assertIn('[PAUSE]',text)
         self.assertIn('0/1',text)
-        self.assertIn('$0.0214/$1.00',text)
+        self.assertIn(f'$0.0214/${self.app.options["max_task_cost_usd"]:.2f}',text)
         self.assertIn('C=continue',text)
         self.assertIn('N: <task>=new',text)
         self.assertEqual(self.app.clients,{})

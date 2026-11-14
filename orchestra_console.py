@@ -8,6 +8,7 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
+from orchestra_progress import clean, describe_tool
 from tool_contracts import EDIT_TOOL_NAMES
 
 
@@ -48,33 +49,8 @@ class AgentDashboard:
             output_tokens=entry.get('output_budget_tokens',entry.get('completion_tokens',0)),
             estimated=entry.get('output_budget_estimated',False))
 
-    @staticmethod
-    def clean(value, limit=240):
-        text = ' '.join(''.join(c if c.isprintable() else ' ' for c in str(value)).split())
-        return text if len(text) <= limit else text[:limit-3] + '...'
-
-    @classmethod
-    def describe_tool(cls, name, args):
-        detail = args.get('path', '')
-        if name == 'read_file':
-            detail += f":{args.get('start_line', 1)}-{args.get('end_line', 'end')}"
-        elif name in {'search_text', 'search_regex'}:
-            detail = f"{detail or '.'} | {args.get('query', args.get('pattern', ''))}"
-        elif name == 'run_check':
-            detail = args.get('name', '')
-        elif name == 'run_command':
-            detail = ' '.join(args.get('argv',[]))
-        elif name == 'finish_task':
-            detail = args.get('id','')
-        elif name == 'set_plan':
-            detail = f"{len(args.get('tasks',[]))} tasks"
-        elif name == 'git_show':
-            detail = f"{args.get('revision', '')} {detail}"
-        elif name == 'git_create_branch':
-            detail = args.get('name', '')
-        elif name == 'create_commit':
-            detail = args.get('message', '')
-        return cls.clean(f'{name} {detail}'.strip())
+    clean = staticmethod(clean)
+    describe_tool = staticmethod(describe_tool)
 
     def action(self, label, message, failed=False):
         label = self.models.get(self.resolve_label(label), label)

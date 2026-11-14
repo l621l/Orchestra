@@ -1,39 +1,30 @@
 """Interactive entry point for Orchestra."""
 import argparse
-import json
 from pathlib import Path
 
-from autodev_console import brief, input_command
-from orchestra import error_description
-from orchestra_console import AgentDashboard
+from autodev_console import format_status
+from autodev_intent import input_command
+from orchestra_app import OrchestraApp
+from orchestra_console import AgentDashboard, print_usage_summary
 from session_state import SessionState
-from turn_trace import TurnTrace
+from workspace_lease import WorkspaceBusy
 
 
 async def main(base):
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", type=Path, default=base / "workspace")
+    parser.add_argument("--data-dir", type=Path, default=base)
     args = parser.parse_args()
-    with (base / "config.local.json").open(encoding="utf-8") as file:
-        config = json.load(file)
-    with (base / "settings.json").open(encoding="utf-8") as file:
-        runtime_settings = json.load(file)
-    with (base / "prompts.json").open(encoding="utf-8") as file:
-        prompts = json.load(file)
-    with (base / "pricing.json").open(encoding="utf-8") as file:
-        pricing = json.load(file)
     if args.workspace == base / "workspace":
         args.workspace.mkdir(exist_ok=True)
-    from direct_dev import DirectDevelopment
-
-    app = DirectDevelopment(config, args.workspace, runtime_settings, prompts, pricing,
-                            dashboard=AgentDashboard())
-    print(f"Pipeline workspace: {app.files.root}")
+    app = OrchestraApp.from_directory(args.data_dir, args.workspace, dashboard=AgentDashboard())
+    engine = app.engine
+    print(f"Pipeline workspace: {engine.files.root}")
     for role in ("writer", "strong"):
-        settings = app.role_settings(role)
+        settings = engine.role_settings(role)
         print(f"{role}: {settings['provider']} / {settings['model']}")
     while True:
-        print('\n'+brief(app))
+        print('\n'+format_status(app.status()))
         try:
             text = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -64,50 +55,19 @@ async def main(base):
                 print('Задание не отправлено в API.')
                 continue
             text=suggestion
-        turn_usage = {}
-        trace = TurnTrace(app.logs_path, text, app.files.root)
-        root_task_id = trace.start_task("worker", text)
-        app.dashboard.start(trace.turn_id, trace.topic,
-                            output_limit=app.total_output_limit)
-        turn_status = "failed"
-        turn_error = None
         try:
-            worker_result = await app.run_user_task(text, turn_usage, trace, root_task_id)
-            trace.event('workspace_result', modified_files=worker_result['modified_files'],
-                        verification=worker_result['verification'],
-                        chain_state=worker_result.get('chain_state'),
-                        blocker=worker_result.get('blocker'),
-                        iterations=worker_result.get('iterations'))
-            answer = worker_result["answer"]
-            result_status = worker_result["status"]
-            trace.save_final_answer(answer)
-            trace.finish_task(root_task_id, result_status)
-            activity = "Work incomplete; see report" if result_status == "partial" else "Task completed"
-            dashboard_status = "partial" if result_status == "partial" else "done"
-            app.dashboard.finish("worker", dashboard_status, activity)
-            app.dashboard.stop()
-            turn_status = result_status
-            print(f"\nAssistant:\n{answer}")
-            if result_status == "partial":
-                print("\n[Partial result: inspect reported gaps and verification in the log.]")
-        except Exception as error:
-            turn_error = type(error).__name__
-            description = error_description(error)
-            trace.error_message = description
-            trace.event('turn_error', error_type=turn_error, message=description)
-            app.dashboard.finish("worker", "failed", turn_error)
-            app.dashboard.stop()
-            trace.finish_task(root_task_id, "failed", turn_error)
-            print(f"Turn failed ({turn_error}): {description}\nLocal file changes were NOT rolled back.")
-        except KeyboardInterrupt:
-            turn_status = "cancelled"
-            turn_error = "KeyboardInterrupt"
-            app.dashboard.finish("worker", "failed", "cancelled")
-            app.dashboard.stop()
-            trace.finish_task(root_task_id, "cancelled", turn_error)
+            result = await app.run(text)
+        except WorkspaceBusy as error:
+            print(error)
+            continue
+        if result['status'] == 'failed':
+            print(f"Turn failed ({result['error_type']}): {result['error']}\n"
+                  "Local file changes were NOT rolled back.")
+        elif result['status'] == 'cancelled':
             print("\nTurn cancelled. Local file changes were NOT rolled back.")
-        finally:
-            app.dashboard.stop()
-            trace.finish(turn_status, turn_error)
-            app.print_usage_summary(turn_usage)
-            print(f"  Log: {trace.directory}")
+        else:
+            print(f"\nAssistant:\n{result['answer']}")
+            if result['status'] == 'partial':
+                print("\n[Partial result: inspect reported gaps and verification in the log.]")
+        print_usage_summary(result['usage'], engine.estimated_cost)
+        print(f"  Log: {result['log_directory']}")

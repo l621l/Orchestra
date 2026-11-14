@@ -37,7 +37,7 @@ def available_tools(settings, repository):
             continue
         if name == 'prepare_commit' and not options.get('allow_git_mutations',False):
             continue
-        if name in {'git_create_branch', 'create_commit'} and not options.get('allow_git_mutations', False):
+        if name in {'git_create_branch', 'create_commit', 'git_pull', 'git_push'} and not options.get('allow_git_mutations', False):
             continue
         if name == 'run_check':
             tool = copy.deepcopy(tool)

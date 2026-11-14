@@ -1,9 +1,14 @@
 """On-disk execution trace for a user turn."""
 import json
+import logging
 import re
 import time
 import uuid
+from copy import deepcopy
 from datetime import datetime, timezone
+
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now():
@@ -13,7 +18,10 @@ def utc_now():
 class TurnTrace:
     """A readable execution tree plus detailed provider events for one user turn."""
 
-    def __init__(self, base, user_input, workspace):
+    def __init__(self, base, user_input, workspace, *, on_event=None, on_progress=None):
+        self.on_event = on_event
+        self.on_progress = on_progress
+        self.cost = None
         stamp = datetime.now(timezone.utc)
         self.turn_id = f"turn_{stamp.strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
         self.topic = self.make_topic(user_input)
@@ -62,8 +70,21 @@ class TurnTrace:
         temporary.replace(path)
 
     def event(self, event_type, **details):
-        self.events.append({"time": utc_now(), "event": event_type, **details})
-        self.write_json("events.json", self.events)
+        event = {"time": utc_now(), "event": event_type, **details}
+        self.events.append(event)
+        with (self.directory / "events.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        self.notify(self.on_event, event)
+
+    def progress(self, kind, **details):
+        self.notify(self.on_progress, {"kind": kind, **details})
+
+    def notify(self, callback, event):
+        if callback is not None:
+            try:
+                callback(deepcopy({"turn_id": self.turn_id, **event}))
+            except Exception:
+                logger.exception("Turn event callback failed")
 
     def start_task(self, agent, description, parent_task_id=None):
         task_id = self.new_id("task")
@@ -190,6 +211,8 @@ class TurnTrace:
         }
         if self.error_type:
             summary["error_type"] = self.error_type
+        if self.cost is not None:
+            summary['cost'] = self.cost
         if self.error_message:
             summary["error_message"] = self.error_message
         self.write_json("summary.json", summary)
@@ -201,3 +224,4 @@ class TurnTrace:
                    duration_seconds=round(time.monotonic() - self.started_at, 1),
                    error_type=error_type)
         self.flush_summary()
+        self.write_json("events.json", self.events)

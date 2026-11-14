@@ -2,6 +2,7 @@
 import copy
 import json
 import time
+from model_errors import ModelResponseError, OutputLimitError, error_description
 from openai import AsyncOpenAI
 
 
@@ -21,22 +22,40 @@ def input_items(messages):
     return items
 
 
+def request_payload(app, role, messages, tools, resource_status, force_final=False,
+                    max_output_tokens=None):
+    settings = app.role_settings(role)
+    instructions = resource_status
+    if force_final:
+        instructions += '\n' + app.prompts['final_response']
+    definitions = [{'type': 'function', **tool['function'], 'strict': False}
+                   for tool in tools] if not force_final else []
+    payload = {
+        'model': settings['model'],
+        'input': input_items(messages) + [{'role': 'system', 'content': instructions}],
+        'tools': definitions,
+        'reasoning': {'effort': app.settings.get('reasoning_effort', 'low')},
+        'max_output_tokens': max_output_tokens or app.settings['generation']['max_output_tokens'],
+        'store': False,
+        'include': ['reasoning.encrypted_content'],
+    }
+    if definitions and getattr(app, 'requires_plan_call', lambda: False)():
+        payload['tool_choice'] = 'required'
+    return payload
+
+
 async def request(app, role, messages, tools, resource_status, turn_usage, trace, task_id,
                   label=None, force_final=False, max_output_tokens=None):
-    from orchestra import ModelResponseError, OutputLimitError, error_description
-    settings=app.role_settings(role)
-    label=label or role
-    provider_name=settings['provider']
-    cap=max_output_tokens or app.settings['generation']['max_output_tokens']
-    effort=app.settings.get('reasoning_effort','low')
-    instructions=resource_status+('\n'+app.prompts['final_response'] if force_final else '')
-    wire=input_items(messages)+[{'role':'system','content':instructions}]
-    definitions=[{'type':'function',**t['function'],'strict':False} for t in tools] if not force_final else []
+    settings = app.role_settings(role)
+    label = label or role
+    provider_name = settings['provider']
+    payload = request_payload(app, role, messages, tools, resource_status, force_final,
+                              max_output_tokens)
     if hasattr(app, 'validate_request_input'):
-        app.validate_request_input(role, {'model':settings['model'],'input':wire,'tools':definitions,
-            'reasoning':{'effort':effort},'max_output_tokens':cap,
-            'store':False,'include':['reasoning.encrypted_content'],
-            **({'tool_choice':'required'} if definitions and getattr(app,'requires_plan_call',lambda:False)() else {})})
+        app.validate_request_input(role, payload)
+    wire, definitions = payload['input'], payload['tools']
+    cap = payload['max_output_tokens']
+    effort = payload['reasoning']['effort']
     entry=app.begin_usage(turn_usage,label,role,provider_name,settings['model'])
     if provider_name not in app.clients:
         provider=app.config['providers'][provider_name]
@@ -49,12 +68,7 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
              'tool_schema_characters':len(json.dumps(definitions, ensure_ascii=False))}
     app.dashboard.update(label,trace.tasks[task_id]['depth'],'waiting for '+settings['model']+' / Responses')
     try:
-        arguments=dict(model=settings['model'],input=wire,
-            tools=definitions,reasoning={'effort':effort},max_output_tokens=cap,
-            store=False,include=['reasoning.encrypted_content'])
-        if definitions and getattr(app,'requires_plan_call',lambda:False)():
-            arguments['tool_choice']='required'
-        response=await app.clients[provider_name].responses.create(**arguments)
+        response=await app.clients[provider_name].responses.create(**payload)
         if response.usage:
             raw=response.usage.model_dump()
             usage={'prompt_tokens':raw['input_tokens'],'completion_tokens':raw['output_tokens'],

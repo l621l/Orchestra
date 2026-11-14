@@ -45,7 +45,7 @@ class ExpertRouting(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.root/'main.py').read_text(),'print("new")')
 
     async def test_final_report_stays_with_writer_even_with_pending_expert(self):
-        self.app.load_or_start('Create program');self.app._position=5
+        self.app.load_or_start('Create program')
         self.app.execute_tool('ask_expert',{'question':'A decision?','context':'Some concrete evidence'})
         async def writer(app,role,*args,**kwargs):
             self.usage(app,role,args)
@@ -79,5 +79,6 @@ class ExpertRouting(unittest.IsolatedAsyncioTestCase):
         with patch('writer_transport.request',side_effect=respond),patch('responses_transport.request',side_effect=AssertionError('No expert final')):
             await self.app.run_user_task('Create program',usage,self.trace,self.parent)
         self.assertGreater(len(seen), 1)
-        self.assertTrue(all(role == 'writer' and tools and not final and cap == 4096
+        expected_cap = self.app.settings['generation']['max_output_tokens']
+        self.assertTrue(all(role == 'writer' and tools and not final and cap == expected_cap
                             for role, tools, final, cap in seen))

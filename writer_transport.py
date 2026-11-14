@@ -1,7 +1,53 @@
 """Bounded Chat Completions transport for the MiMo writer."""
 import time
 import json
+from types import SimpleNamespace
+from model_errors import OutputLimitError, ModelResponseError, error_description
 from openai import AsyncOpenAI
+
+
+async def stream_completion(client, arguments, on_reasoning):
+    stream = await client.chat.completions.create(
+        **arguments, stream=True, stream_options={'include_usage': True})
+    content, reasoning, refusal = [], [], []
+    calls = {}
+    response = SimpleNamespace(id=None, model=None, usage=None, choices=[])
+    finish = None
+    async with stream:
+        async for chunk in stream:
+            response.id = chunk.id or response.id
+            response.model = chunk.model or response.model
+            if chunk.usage is not None:
+                response.usage = chunk.usage
+            for choice in chunk.choices:
+                if choice.index != 0:
+                    continue
+                finish = choice.finish_reason or finish
+                delta = choice.delta
+                if delta is None:
+                    continue
+                content.append(delta.content or '')
+                refusal.append(getattr(delta, 'refusal', None) or '')
+                fragment = getattr(delta, 'reasoning_content', None)
+                if isinstance(fragment, str) and fragment:
+                    reasoning.append(fragment)
+                    on_reasoning(fragment)
+                for part in delta.tool_calls or ():
+                    call = calls.setdefault(part.index, {'id': '', 'type': 'function',
+                                                         'function': {'name': '', 'arguments': ''}})
+                    call['id'] += part.id or ''
+                    if part.function:
+                        call['function']['name'] += part.function.name or ''
+                        call['function']['arguments'] += part.function.arguments or ''
+    result = {'role': 'assistant', 'reasoning_content': ''.join(reasoning)}
+    if any(content):
+        result['content'] = ''.join(content)
+    if any(refusal):
+        result['refusal'] = ''.join(refusal)
+    if calls:
+        result['tool_calls'] = [calls[index] for index in sorted(calls)]
+    response.choices.append(SimpleNamespace(finish_reason=finish, message=None))
+    return response, result
 
 
 def wire_messages(messages, config):
@@ -30,7 +76,6 @@ def wire_messages(messages, config):
 
 async def request(app, role, messages, tools, resource_status, turn_usage, trace,
                   task_id, label=None, force_final=False, max_output_tokens=None, disable_thinking=False):
-    from orchestra import OutputLimitError, ModelResponseError, error_description
     config = app.role_settings(role)
     label = label or 'writer'
     provider = config['provider']
@@ -39,6 +84,9 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
     thinking='disabled' if force_final or disable_thinking else config.get('thinking','enabled')
     if thinking not in {'enabled','disabled'}:
         raise ValueError('thinking must be enabled or disabled.')
+    streaming = (config.get('stream_reasoning') is True
+                 and getattr(trace, 'on_progress', None) is not None
+                 and thinking == 'enabled' and config['model'].lower().startswith('mimo'))
     wire.append({'role':'system','content':resource_status})
     if force_final:
         wire.append({'role':'system','content':app.prompts['final_response']})
@@ -62,11 +110,18 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
             arguments['extra_body'] = {'thinking':{'type':thinking}}
         if tools and not force_final:
             arguments['tools'] = tools
-        response = await app.clients[provider].chat.completions.create(**arguments)
+        client = app.clients[provider]
+        if streaming:
+            def publish(fragment):
+                trace.progress('reasoning', model=config['model'], request_id=request_id, text=fragment)
+
+            response, result = await stream_completion(client, arguments, publish)
+        else:
+            response = await client.chat.completions.create(**arguments)
+            result = response.choices[0].message.model_dump(exclude_none=True)
         if response.usage:
             usage = response.usage.model_dump(exclude_none=True)
         choice = response.choices[0]
-        result = choice.message.model_dump(exclude_none=True)
         reasoning_characters=len(result.get('reasoning_content') or '')
         if choice.finish_reason == 'length':
             raise OutputLimitError('MiMo output limit reached.', draft=result.get('content'),
@@ -100,5 +155,6 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
         trace.record_request(task_id, request_id, getattr(response,'id',None), provider, config['model'],
             getattr(response,'model',None), time.monotonic()-started,
             response.choices[0].finish_reason if response and response.choices else None,
-            usage, error_type, {'api':'chat_completions','thinking':thinking,'max_output_tokens':cap},
+            usage, error_type, {'api':'chat_completions','thinking':thinking,
+                                'stream':streaming,'max_output_tokens':cap},
             {'reasoning_characters':reasoning_characters})

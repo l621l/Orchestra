@@ -1,7 +1,17 @@
 """Explicit console commands; ordinary text follows the unfinished task."""
 
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TaskRequest:
+    action: str
+    text: str
+
 
 def input_command(text):
+    if isinstance(text, TaskRequest):
+        return text.action, text.text
     stripped=text.strip()
     lowered=stripped.casefold()
     if lowered in {'c','с','продолжи','продолжить','continue','resume'}:return 'continue',''
@@ -19,5 +29,5 @@ def input_command(text):
 def continuation_intent(text,has_checkpoint):
     command,payload=input_command(text)
     if command in {'new', 'debug'}:return False,''
-    if command=='continue':return True,''
+    if command=='continue':return True,payload
     return bool(has_checkpoint),payload if has_checkpoint else ''
