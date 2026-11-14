@@ -44,6 +44,32 @@ class Responses(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wire[0]['encrypted_content'],'opaque')
         self.assertEqual(wire[-1],{'type':'function_call_output','call_id':'call_1','output':'OK'})
 
+    async def test_sol_stream_displays_and_records_summary_and_preserves_tool_calls(self):
+        from responses_transport import receive_summary_stream
+
+        progress = []
+        self.trace.on_progress = progress.append
+        final = response([Item(type='function_call', call_id='call_1', name='list_files',
+                               arguments='{}', status='completed')])
+
+        async def events():
+            for text in ('Checking ', 'requirements'):
+                yield SimpleNamespace(type='response.reasoning_summary_text.delta', delta=text)
+            yield SimpleNamespace(type='response.completed', response=final)
+
+        stream = AsyncMock()
+        stream.__aenter__.return_value = events()
+        create = AsyncMock(return_value=stream)
+        client = SimpleNamespace(responses=SimpleNamespace(create=create))
+        payload = {'model': 'gpt-6.1-sol', 'reasoning': {'effort': 'low', 'summary': 'auto'}}
+        received = await receive_summary_stream(client, payload, self.trace, self.task, 'req_test')
+
+        self.assertIs(received, final)
+        create.assert_awaited_once_with(**payload, stream=True)
+        self.assertEqual([event['text'] for event in progress], ['Checking ', 'requirements'])
+        self.assertEqual(self.trace.events[-1]['text'], 'Checking requirements')
+        self.assertEqual(self.trace.events[-1]['event'], 'reasoning_summary')
+
     async def test_incomplete_only_preserves_complete_prefix(self):
         items=[Item(type='function_call',call_id='a',name='list_files',arguments='{}',status='completed'),
                Item(type='function_call',call_id='b',name='read_file',arguments='{',status='incomplete'),

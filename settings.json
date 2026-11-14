@@ -39,7 +39,7 @@
     "strong_context_characters": 6000,
     "strong_request_characters": 16000,
     "writer_context_characters": 12000,
-    "writer_request_characters": 96000,
+    "writer_request_characters": 192000,
     "no_progress_calls": 6,
     "recovery_calls": 4,
     "repeated_action_limit": 3,

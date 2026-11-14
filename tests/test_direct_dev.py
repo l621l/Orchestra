@@ -172,6 +172,8 @@ class DirectLoop(unittest.IsolatedAsyncioTestCase):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);self.root=Path(tmp.name)
         base=Path(__file__).resolve().parents[1]
         settings=json.loads((base/'settings.json').read_text())
+        # These scripted replies exercise the implementation loop; review has its own tests.
+        settings['execution']['completion_review_enabled'] = False
         config={'providers':{'mimo':{},'gpt':{}},'roles':{'writer':{'provider':'mimo','model':'mimo-v2.6-pro'},'strong':{'provider':'gpt','model':'gpt-6.1-sol'}}}
         with patch('orchestra.BASE',self.root):
             self.app=DirectDevelopment(config,self.root,settings,json.loads((base/'prompts.json').read_text()),json.loads((base/'pricing.json').read_text()))

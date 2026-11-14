@@ -411,6 +411,8 @@ class Orchestra:
         continuation_repeats = 0
         research_warning_sent = False
         reserve_warning_sent = False
+        completion_review_started = False
+        completion_review_end = None
         implementation_requested = requires_implementation(messages)
 
         def result(answer, partial=False):
@@ -431,7 +433,9 @@ class Orchestra:
                 trace.event('output_budget_exhausted', task_id=task_id, used=output_used, limit=output_ceiling)
                 return outcome
             final_reserve = 0 if direct else min(self.settings['execution'].get('final_output_reserve_tokens', 512), output_ceiling)
-            force_final = step == call_limit - 1 or budget['calls'] == 1 or output_remaining <= final_reserve+getattr(self,'min_working_output_tokens',0)
+            force_final = (step == call_limit - 1 or budget['calls'] == 1
+                           or (completion_review_end is not None and step >= completion_review_end - 1)
+                           or output_remaining <= final_reserve+getattr(self,'min_working_output_tokens',0))
             step_tools = [] if force_final else self.tools_for_step(tools, step)
             definitions = {tool['function']['name']: tool for tool in step_tools}
             research_limit = self.settings['execution'].get('research_calls_before_action', 4)
@@ -458,6 +462,8 @@ class Orchestra:
                 self.dashboard.action(label, 'Research checkpoint: focus on a concrete change or reproducing check.')
             prior = turn_usage.get(label, {})
             effective_output_limit = self.settings['generation']['max_output_tokens']
+            if completion_review_started:
+                effective_output_limit = min(effective_output_limit, 2048)
             effective_output_limit = min(effective_output_limit,
                 output_remaining if force_final else output_remaining - final_reserve)
             resource_status = self.prompts['resource_status'].format(
@@ -662,7 +668,45 @@ class Orchestra:
                         'done': False, 'state': 'continue', 'blocker': None}, ensure_ascii=False)
                     facts['stop_reason'] = 'verification_required' if unverified_edit else 'premature_report'
                     return facts
+                wants_complete = (isinstance(report, dict) and report.get('done') is True
+                                  and report.get('state') == 'complete')
+                review_enabled = (direct and self.settings['execution'].get('completion_review_enabled', True))
+                if (review_enabled and not completion_review_started and wants_complete
+                        and not blocker and (state.changed or implementation_requested)):
+                    if force_final or budget['calls'] <= 0:
+                        report.update(done=False, state='continue',
+                                      next_steps='Completion review was not run: request budget exhausted.')
+                        outcome = result(json.dumps(report, ensure_ascii=False), partial=True)
+                        outcome['stop_reason'] = 'completion_review_pending'
+                        trace.event('completion_review_skipped', task_id=task_id, reason='request_budget')
+                        return outcome
+                    completion_review_started = True
+                    # One review episode, including diagnosis, repair and its final report.
+                    completion_review_end = min(call_limit, step + 5)
+                    messages.append({'role': 'system', 'content':
+                        'ONE-TIME COMPLETION REVIEW. The previous completion report is provisional. '
+                        'Use the original user requirements and current changes already in this conversation. '
+                        'Inspect a focused diff or source fragment only if needed; do not reread the whole project. '
+                        'Look for at most two concrete counterexamples to required behavior, especially distinct '
+                        'failure boundaries, alternate valid input representations, and persistence invariants. '
+                        'Passing existing tests is not proof of untested behavior. If a suspected defect exists, '
+                        'reproduce it with a focused check, fix only a confirmed defect, then rerun that check. '
+                        'No speculative refactoring, broad test suite expansion, or second review round. '
+                        'You have at most four additional requests INCLUDING the final report, each capped at '
+                        '2048 output tokens; existing task cost and request limits still apply. Batch independent '
+                        'checks where useful. If no concrete defect is found, return the final task JSON now. '
+                        'In summary state what was reviewed, actual check results, and any unverified gaps. '
+                        'If a defect remains or a repair is unverified when budget ends, use done=false, '
+                        'state=continue and specific next_steps. Do not claim review or repair success without evidence.'})
+                    trace.event('completion_review_started', task_id=task_id,
+                                max_requests=min(4, budget['calls'], call_limit-step-1),
+                                max_output_tokens_per_request=2048)
+                    self.dashboard.action(label, 'Checking requirements and counterexamples before completion.')
+                    continue
                 outcome = result(answer)
+                if completion_review_started:
+                    trace.event('completion_review_finished', task_id=task_id,
+                                completed=wants_complete and outcome['status'] == 'completed')
                 if force_final:
                     outcome['stop_reason'] = 'call_limit' if direct else 'report_budget_boundary'
                 elif blocker:

@@ -7,6 +7,7 @@ import math
 import shutil
 import re
 from datetime import datetime,timezone
+from pathlib import Path
 from model_errors import ModelResponseError, TaskCostLimit, error_description
 from model_routing import clip, role_settings
 from development_state import new_task, read_task
@@ -100,8 +101,12 @@ SOL_WORKFLOW = (
     'containing action, reason and observed evidence.'
 )
 
+ACCEPTANCE_SKILL = (Path(__file__).resolve().parent / 'skills' /
+                    'implementation-acceptance' / 'SKILL.md')
+
 
 class DirectDevelopment(Orchestra):
+    stream_responses_reasoning = True
     direct_mode=True
     min_working_output_tokens=512
     def __init__(self,*args,**kwargs):
@@ -652,7 +657,8 @@ class DirectDevelopment(Orchestra):
             self.journal_event('run_started', task=clip(state['specification'], 280))
             if messages and messages[0]['role']=='system':
                 if self.uses_sol_writer():
-                    messages[0]['content'] = SOL_WORK_PROMPTS[debug] + '\n\n' + SOL_WORKFLOW
+                    acceptance = ACCEPTANCE_SKILL.read_text(encoding='utf-8').split('---', 2)[2].strip()
+                    messages[0]['content'] = '\n\n'.join((SOL_WORK_PROMPTS[debug], SOL_WORKFLOW, acceptance))
                 else:
                     messages[0]['content'] = (DEBUG_PROMPT if debug else DIRECT_PROMPT) + '\n\n' + EDIT_NEXT
                     if debug:

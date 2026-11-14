@@ -80,7 +80,7 @@ class DesktopWindow:
         tabs = ttk.Notebook(frame)
         tabs.grid(row=6, column=0, columnspan=2, sticky='nsew')
         self.output = self.text_tab(tabs, 'Журнал')
-        self.reasoning = self.text_tab(tabs, 'Рассуждения MiMo')
+        self.reasoning = self.text_tab(tabs, 'Рассуждения')
         root.protocol('WM_DELETE_WINDOW', self.close)
         self.reload_projects()
         self.refresh()

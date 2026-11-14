@@ -6,6 +6,30 @@ from model_errors import ModelResponseError, OutputLimitError, error_description
 from openai import AsyncOpenAI
 
 
+async def receive_summary_stream(client, payload, trace, task_id, request_id):
+    response = None
+    fragments = []
+    stream = await client.responses.create(**payload, stream=True)
+    try:
+        async with stream as events:
+            async for event in events:
+                if event.type == 'response.reasoning_summary_text.delta' and event.delta:
+                    fragments.append(event.delta)
+                    trace.progress('reasoning', model=payload['model'], request_id=request_id,
+                                   text=event.delta)
+                elif event.type in {'response.completed', 'response.incomplete', 'response.failed'}:
+                    response = event.response
+                elif event.type == 'error':
+                    raise ModelResponseError(str(event.message))
+    finally:
+        if fragments:
+            trace.event('reasoning_summary', task_id=task_id, request_id=request_id,
+                        model=payload['model'], text=''.join(fragments))
+    if response is None:
+        raise ModelResponseError('Responses stream ended without a final response.')
+    return response
+
+
 def input_items(messages):
     items=[]
     for message in messages:
@@ -39,6 +63,8 @@ def request_payload(app, role, messages, tools, resource_status, force_final=Fal
         'store': False,
         'include': ['reasoning.encrypted_content'],
     }
+    if settings['model'] == 'gpt-6.1-sol' and getattr(app, 'stream_responses_reasoning', False):
+        payload['reasoning']['summary'] = 'auto'
     if definitions and getattr(app, 'requires_plan_call', lambda: False)():
         payload['tool_choice'] = 'required'
     return payload
@@ -68,7 +94,11 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
              'tool_schema_characters':len(json.dumps(definitions, ensure_ascii=False))}
     app.dashboard.update(label,trace.tasks[task_id]['depth'],'waiting for '+settings['model']+' / Responses')
     try:
-        response=await app.clients[provider_name].responses.create(**payload)
+        client = app.clients[provider_name]
+        if 'summary' in payload['reasoning']:
+            response = await receive_summary_stream(client, payload, trace, task_id, request_id)
+        else:
+            response = await client.responses.create(**payload)
         if response.usage:
             raw=response.usage.model_dump()
             usage={'prompt_tokens':raw['input_tokens'],'completion_tokens':raw['output_tokens'],

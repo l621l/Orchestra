@@ -50,7 +50,7 @@ class MiMoContext(unittest.IsolatedAsyncioTestCase):
         self.app.fit_history(messages,self.app.available_tools())
         self.assertEqual(messages,before)
         self.assertGreater(len(json.dumps(messages)),24000)
-        self.assertEqual(self.app.options['writer_request_characters'],96000)
+        self.assertEqual(self.app.options['writer_request_characters'],192000)
 
     def test_actual_compaction_has_observations_and_never_cuts_retained_reasoning(self):
         self.app.load_or_start('Develop program');self.app.options['writer_request_characters']=24000

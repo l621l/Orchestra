@@ -36,6 +36,8 @@ def validate_settings(settings):
             raise ValueError(f"Invalid settings: roles.{role}.max_delegations")
     if type(settings['execution'].get('stop_after_confirmation', True)) is not bool:
         raise ValueError('stop_after_confirmation must be boolean.')
+    if type(settings['execution'].get('completion_review_enabled', True)) is not bool:
+        raise ValueError('completion_review_enabled must be boolean.')
     if type(settings['execution'].get('project_map_enabled',True)) is not bool:
         raise ValueError('project_map_enabled must be boolean.')
     map_limit=settings['execution'].get('project_map_context_characters',2500)
