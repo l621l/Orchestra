@@ -124,10 +124,10 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
         choice = response.choices[0]
         reasoning_characters=len(result.get('reasoning_content') or '')
         if choice.finish_reason == 'length':
-            raise OutputLimitError('MiMo output limit reached.', draft=result.get('content'),
+            raise OutputLimitError('Model output limit reached.', draft=result.get('content'),
                                    tool_drafts=result.get('tool_calls',[]))
         if choice.finish_reason not in {'stop','tool_calls'} or result.get('refusal'):
-            raise ModelResponseError('MiMo did not complete: ' + str(choice.finish_reason))
+            raise ModelResponseError('Model did not complete: ' + str(choice.finish_reason))
         message={k:v for k,v in result.items() if k in {'role','content','tool_calls'}}
         if config['model'].lower().startswith('mimo'):
             message['reasoning_content']=result.get('reasoning_content') or ''

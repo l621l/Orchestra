@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 from orchestra_app import OrchestraApp
 from orchestra_progress import SilentProgress
+from project_usage import IGNORE_RULE, read_usage
 from workspace_lease import WorkspaceBusy
 
 
@@ -64,6 +65,37 @@ class ApplicationTurns(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary['status'], 'completed')
         self.assertEqual(summary['cost'], {'estimated_usd': 0.4344671, 'complete': True})
         self.assertEqual(events[-1]['cost'], summary['cost'])
+
+    async def test_project_usage_survives_new_sessions_and_counts_cancelled_calls(self):
+        started = asyncio.Event()
+        result_body = self.engine.run_user_task.return_value
+
+        async def run(text, usage, trace, task_id):
+            model = 'sol' if not started.is_set() else 'other'
+            usage['writer'] = {'provider': 'gpt', 'model': model, 'api_calls': 1,
+                               'reported_calls': 1, 'total_tokens': 55, 'cached_tokens': 30}
+            if started.is_set():
+                await asyncio.Future()
+            started.set()
+            return result_body
+
+        self.engine.run_user_task.side_effect = run
+        self.engine.estimated_cost = Mock(side_effect=[0.25, 0.125])
+        ignore = self.root / '.gitignore'
+        ignore.write_bytes(b'/private')
+        await self.app.new_task('Implement a feature')
+        second = asyncio.create_task(OrchestraApp(self.engine).new_task('Another feature'))
+        await asyncio.sleep(0)
+        second.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await second
+        data = read_usage(self.root)
+        self.assertEqual(data['runs'], 2)
+        self.assertEqual(data['total']['estimated_usd'], 0.375)
+        self.assertEqual(data['total']['cached_tokens'], 60)
+        self.assertEqual({entry['model']: entry['estimated_usd'] for entry in data['models']},
+                         {'sol': 0.25, 'other': 0.125})
+        self.assertEqual(ignore.read_text(encoding='utf-8').splitlines(), ['/private', IGNORE_RULE])
 
     async def test_cancel_closes_trace_and_releases_session(self):
         started = asyncio.Event()

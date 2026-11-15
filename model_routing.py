@@ -19,5 +19,5 @@ def role_settings(config, role):
     transport = {'mimo': 'chat', 'gpt': 'responses'}.get(family)
     if (not transport or writer.get('provider') not in config.get('providers', {})
             or writer.get('transport', transport) != transport):
-        raise ValueError('Configure roles.writer with MiMo (chat) or GPT (responses).')
+        raise ValueError('Configure roles.writer with a supported model and matching API transport.')
     return {**writer, 'transport': transport}

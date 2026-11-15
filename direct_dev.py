@@ -281,6 +281,24 @@ class DirectDevelopment(Orchestra):
         return 'Earlier conversation was compacted. These are recorded facts, not proof of completion. Source files on disk remain authoritative. Continue the next actual edit instead of rescanning everything.\n'+json.dumps(summary,ensure_ascii=False)
 
 
+    def history_tool_result(self, name, args, output):
+        if self.role_settings('writer')['transport'] != 'responses':
+            return output
+        result = output.get('result')
+        if not isinstance(result, dict):
+            return output
+        if name == 'read_file':
+            fitted = fit_event({'tool': name, 'args': args, 'result': output}, 10000)
+            if fitted and not fitted.get('payload_omitted'):
+                return fitted['result']
+        if name in {'run_command', 'run_check'} and len(result.get('output') or '') > 4000:
+            return {**output, 'result': {
+                **result,
+                'output': '[command output shortened; showing the last 4000 characters]\n'
+                          + result['output'][-4000:],
+            }}
+        return output
+
     def fit_history(self, messages, tools, resource_status='', force_final=False, max_output_tokens=None):
         """Retain full code and reasoning normally; compact old complete turns only at the real cap."""
         cap = self.options['writer_request_characters']
@@ -314,7 +332,7 @@ class DirectDevelopment(Orchestra):
             removed += 1
             return True
         # Prefer dropping old turns to mutilating newly read source. Preserve recent pairs and full reasoning.
-        target = cap
+        target = cap * 3 // 4 if config["transport"] == "responses" else cap
         while wire_size()>target and sum(m.get('role')=='assistant' for m in messages)>2:
             evict_oldest()
         legacy_history = messages if wire_size() > cap else ()

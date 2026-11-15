@@ -37,18 +37,38 @@ class DirectCore(unittest.IsolatedAsyncioTestCase):
             'type': 'function_call', 'call_id': 'edit', 'status': 'completed',
             'name': 'create_file', 'arguments': '{"path":"result.txt","content":"ok"}',
         })
-        create = AsyncMock(side_effect=[
+        async def events(response, summary=None):
+            if summary:
+                yield SimpleNamespace(type='response.reasoning_summary_text.delta', delta=summary)
+            yield SimpleNamespace(type='response.completed', response=response)
+
+        first = AsyncMock()
+        first.__aenter__.return_value = events(
             SimpleNamespace(id='first', model='gpt-6.1-sol', usage=None,
                             status='completed', output=[item], output_text=''),
+            'Проверяю структуру проекта')
+        summary_item = SimpleNamespace(
+            type='reasoning',
+            summary=[SimpleNamespace(text='Проверка завершена')],
+            model_dump=lambda **kwargs: {'type': 'reasoning', 'summary': []},
+        )
+        last = AsyncMock()
+        last.__aenter__.return_value = events(
             SimpleNamespace(id='final', model='gpt-6.1-sol', usage=None,
-                            status='completed', output=[], output_text=json.dumps({
+                            status='completed', output=[summary_item], output_text=json.dumps({
                                 'summary': 'Created', 'done': True, 'state': 'complete',
-                            })),
-        ])
+                            })))
+        create = AsyncMock(side_effect=[first, last])
+        progress = []
+        self.trace.on_progress = progress.append
         self.app.clients['gpt'] = SimpleNamespace(responses=SimpleNamespace(create=create))
         result = await self.app.run_user_task('Create result.txt', {}, self.trace, self.parent)
         self.assertEqual(result['status'], 'completed')
         self.assertEqual((self.root / 'result.txt').read_text(), 'ok')
+        self.assertTrue(create.call_args.kwargs['stream'])
+        self.assertEqual(create.call_args.kwargs['reasoning']['summary'], 'auto')
+        self.assertEqual([event['text'] for event in progress if event['kind'] == 'reasoning'],
+                         ['Проверяю структуру проекта', 'Проверка завершена'])
         self.assertTrue(any(item.get('type') == 'function_call_output' and item['call_id'] == 'edit'
                             for item in create.call_args.kwargs['input']))
 

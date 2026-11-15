@@ -6,28 +6,11 @@ import tkinter as tk
 from tkinter import ttk
 from urllib.parse import urlsplit
 
+from desktop_options import DEFAULT_CONFIG, LIMITS
 from desktop_theme import BACKGROUND
 from interface_notes import atomic_text
 from model_routing import role_settings
 from orchestra_config import validate_settings, normalize_settings
-
-
-LIMITS = (
-    ('direct', 'max_task_cost_usd', 'Порог расходов на задачу, USD', float, 0, 0.1),
-    ('api', 'timeout_seconds', 'Тайм-аут API, сек.', float, 0, 180),
-    ('execution', 'max_api_calls_per_turn', 'Вызовы API за запуск', int, 1, 300),
-    ('execution', 'max_steps_per_agent', 'Шаги за запуск', int, 1, 100),
-    ('generation', 'max_output_tokens', 'Выходные токены на запрос', int, 1, 131072),
-    ('direct', 'writer_request_characters', 'Размер запроса исполнителя, символы', int, 3000, 24000),
-    ('direct', 'no_progress_calls', 'Шаги без прогресса до восстановления', int, 1, 6),
-    ('direct', 'recovery_calls', 'Шаги восстановления', int, 1, 4),
-)
-
-DEFAULT_CONFIG = {
-    'providers': {'mimo': {'api_key': '', 'base_url': 'https://api.xiaomimimo.com/v1'},
-                  'gpt': {'api_key': '', 'base_url': ''}},
-    'roles': {'writer': {'provider': 'mimo', 'model': 'mimo-v2.6-pro'}},
-}
 
 
 class SettingsDialog:
@@ -95,11 +78,13 @@ class SettingsDialog:
                     writer['model'].set(choices[0] if choices else '')
 
                 writer['provider'].trace_add('write', update_writer_models)
-        self.thinking = self.field(models, 6, 'Рассуждения MiMo',
+        self.thinking = self.field(models, 6, 'Рассуждения модели (Chat Completions)',
                                    role_settings(self.config, 'writer').get('thinking', 'enabled'),
                                    choices=('enabled', 'disabled'))
+        writer_config = role_settings(self.config, 'writer')
         self.stream_reasoning = tk.BooleanVar(
-            master=models, value=role_settings(self.config, 'writer').get('stream_reasoning') is True)
+            master=models, value=writer_config.get('stream_reasoning',
+                                                   writer_config['model'].lower() == 'gpt-6.1-sol') is True)
         ttk.Checkbutton(models, text='Показывать рассуждения в реальном времени',
                         variable=self.stream_reasoning).grid(row=7, columnspan=2, sticky='w', pady=4)
         ttk.Label(models, text='Для новых моделей нужны тарифы в pricing.json.',

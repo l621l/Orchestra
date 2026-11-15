@@ -34,6 +34,15 @@ async def receive_summary_stream(client, payload, trace, task_id, request_id):
                                        name=name, text=event.delta)
                 elif event.type in {'response.completed', 'response.incomplete', 'response.failed'}:
                     response = event.response
+                    if not fragments:
+                        for item in response.output:
+                            if getattr(item, 'type', None) != 'reasoning':
+                                continue
+                            for part in item.summary:
+                                if part.text:
+                                    fragments.append(part.text)
+                                    trace.progress('reasoning', model=payload['model'],
+                                                   request_id=request_id, text=part.text)
                 elif event.type == 'error':
                     raise ModelResponseError(str(event.message))
     finally:
@@ -78,7 +87,7 @@ def request_payload(app, role, messages, tools, resource_status, force_final=Fal
         'store': False,
         'include': ['reasoning.encrypted_content'],
     }
-    if settings['model'] == 'gpt-6.1-sol' and getattr(app, 'stream_responses_reasoning', False):
+    if settings['model'].lower() == 'gpt-6.1-sol' and settings.get('stream_reasoning', True):
         payload['reasoning']['summary'] = 'auto'
     return payload
 
@@ -105,6 +114,7 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
              'messages':len(wire),'tools_available':len(definitions),'forced_final':force_final,
              'input_characters':len(json.dumps(wire, ensure_ascii=False)),
              'tool_schema_characters':len(json.dumps(definitions, ensure_ascii=False))}
+    metrics['reasoning_summary'] = payload['reasoning'].get('summary')
     app.dashboard.update(label,trace.tasks[task_id]['depth'],'waiting for '+settings['model']+' / Responses')
     try:
         client = app.clients[provider_name]
