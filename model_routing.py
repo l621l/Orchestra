@@ -11,17 +11,13 @@ def clip(text, limit):
 
 
 def role_settings(config, role):
-    role = 'writer' if role == 'worker' else role
-    if role not in {'writer', 'strong'}:
-        raise ValueError('Unsupported alternating role: '+role)
-    roles = config.get('roles', {})
-    providers = config.get('providers', {})
-    config = roles.get(role)
-    if role == 'strong' and config is None:
-        config = roles.get('director')
-    if (not isinstance(config, dict)
-            or config.get('provider') not in providers
-            or not isinstance(config.get('model'), str) or not config['model'].strip()
-            or config.get('transport', 'responses' if role == 'strong' else 'chat') not in {'chat', 'responses'}):
-        raise ValueError('Configure roles.'+role+' with provider, model and transport (chat/responses).')
-    return config
+    if role not in {'worker', 'writer'}:
+        raise ValueError('Direct supports one writer.')
+    writer = config.get('roles', {}).get('writer', {})
+    model = writer.get('model', '') if isinstance(writer, dict) else ''
+    family = model.lower().partition('-')[0] if isinstance(model, str) else ''
+    transport = {'mimo': 'chat', 'gpt': 'responses'}.get(family)
+    if (not transport or writer.get('provider') not in config.get('providers', {})
+            or writer.get('transport', transport) != transport):
+        raise ValueError('Configure roles.writer with MiMo (chat) or GPT (responses).')
+    return {**writer, 'transport': transport}

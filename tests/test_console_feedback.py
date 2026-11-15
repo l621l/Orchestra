@@ -43,13 +43,14 @@ class ConsoleFeedback(unittest.TestCase):
         self.assertIn('text_not_found', output)
         self.assertIn('Read the current fragment.', output)
 
-    def test_output_budget_is_a_compact_total_column(self):
+    def test_output_tokens_are_a_compact_total_column(self):
         self.dashboard.update('worker')
-        self.dashboard.update_output_budget(5000,20000)
+        self.dashboard.update_output_budget(5000,None)
         self.dashboard.console.print(self.dashboard.render())
         output=self.stream.getvalue()
         self.assertIn('Output',output)
-        self.assertIn('5k/20k',output)
+        self.assertIn('5k',output)
+        self.assertNotIn('/20k',output)
         self.assertNotIn('remaining',output)
         self.assertIsNone(self.dashboard.render().caption)
 

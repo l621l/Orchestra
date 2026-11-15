@@ -22,9 +22,7 @@ class OutputRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(pool['calls'], 4)
         self.assertEqual(result['verification']['status'], 'passed')
-        execution = self.settings['execution']
-        expected_cap = min(self.settings['generation']['max_output_tokens'],
-                           execution['max_output_tokens_per_turn'] - execution['final_output_reserve_tokens'])
+        expected_cap = self.settings['generation']['max_output_tokens']
         self.assertEqual(self.app.request.call_args_list[1].kwargs['max_output_tokens'], expected_cap)
         self.assertEqual(sum(e['event']=='output_limit_recovery_started' for e in self.trace.events),1)
         self.assertIsNone(self.trace.error_message)
@@ -58,15 +56,6 @@ class OutputRecovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.root/'value.txt').read_text(),'correct')
         self.assertEqual(sum(e['event']=='output_limit_recovery_started' for e in self.trace.events),2)
 
-    async def test_truncation_does_not_bypass_shared_output_budget(self):
-        usage={}
-        async def request(*args,**kwargs):
-            usage['worker']={'output_budget_tokens':20000}
-            raise OutputLimitError('length')
-        self.app.request=request
-        result=await self.app.run('worker',[],{'calls':100},usage,self.trace,self.task)
-        self.assertEqual(result['status'],'partial')
-        self.assertFalse(any(e['event']=='output_limit_recovery_started' for e in self.trace.events))
 
     async def test_other_protocol_failure_is_not_retried(self):
         with self.assertRaises(ModelResponseError):

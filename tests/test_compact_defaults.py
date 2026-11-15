@@ -15,19 +15,6 @@ class CompactDefaults(unittest.IsolatedAsyncioTestCase):
     def timeout(self):
         return APITimeoutError(request=SimpleNamespace(method='POST',url='https://offline.invalid'))
 
-    async def test_timeout_preserves_changes_and_stops_chain(self):
-        self.app.request=AsyncMock(side_effect=[
-            self.response(self.call('create_file',path='value.txt',content='correct')),self.timeout()])
-        result=await self.app.run_iterations('original',{},self.trace,self.task)
-        self.assertEqual(result['status'],'partial')
-        self.assertEqual(result['stop_reason'],'request_timeout')
-        self.assertEqual(result['iterations'],1)
-        self.assertEqual(self.app.request.call_count,2)
-        self.assertEqual((self.root/'value.txt').read_text(),'correct')
-        saved=json.loads((self.trace.directory/'iteration_1.json').read_text())
-        self.assertIn('value.txt',saved['runtime']['modified_files'])
-        self.assertIn('timed out',saved['report']['summary'])
-        self.assertTrue(any(e['event']=='chain_paused_after_timeout' for e in self.trace.events))
 
     def test_git_history_and_commit_preparation_are_opt_in(self):
         self.app.repository.available=True

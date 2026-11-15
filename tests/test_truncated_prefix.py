@@ -54,19 +54,6 @@ class TruncatedPrefix(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outputs[1]['error'],'skipped_after_prefix_failure')
         self.assertFalse((self.root/'dependent.py').exists())
 
-    async def test_output_exhaustion_still_preserves_complete_work_without_another_request(self):
-        usage={}
-        first=self.call('create_file',path='value.txt',content='correct')
-        async def request(*args,**kwargs):
-            usage['worker']={'output_budget_tokens':20000}
-            raise OutputLimitError('length',tool_drafts=[first,self.unfinished()])
-        self.app.request=AsyncMock(side_effect=request)
-        result=await self.app.run('worker',[],{'calls':100},usage,self.trace,self.task)
-        self.assertEqual(self.app.request.await_count,1)
-        self.assertEqual(result['status'],'partial')
-        self.assertEqual(result['modified_files'],['value.txt'])
-        self.assertEqual((self.root/'value.txt').read_text(),'correct')
-
     def test_schema_errors_duplicate_ids_and_git_mutations_are_not_salvaged(self):
         definitions={t['function']['name']:t for t in self.app.available_tools()}
         valid=self.call('create_file',path='a.py',content='ok')

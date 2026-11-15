@@ -84,3 +84,63 @@ def referenced_project_files(repository,argv):
                 if argv[2] in json.loads(manifest.read_text(encoding='utf-8')).get('scripts',{}):files.append('package.json')
             except (OSError,ValueError):pass
     return sorted(set(files))
+
+
+"""Small workflow tools and bounded execution of project runtimes."""
+import os
+import shutil
+import sys
+from tools import definition
+from tool_errors import ToolError
+
+
+WORKFLOW_TOOLS = [
+    definition('run_command','Run project command without shell; bounded time/output. Use {python} for Python.',
+        {'argv':{'type':'array','minItems':1,'maxItems':64,'items':{'type':'string','minLength':1,'maxLength':8000}},
+         'purpose':{'type':'string','enum':['inspect','build','verify'],'description':'Default inspect; verify must execute project code.'},
+         'criteria':{'type':'array','maxItems':4,'items':{'type':'integer','minimum':1,'maximum':4},'description':'1-based current acceptance criteria checked.'},
+         'timeout_seconds':{'type':'integer','minimum':1,'maximum':30}},['argv']),
+]
+
+
+def run_command(repository, argv, timeout_seconds=15, purpose='inspect', criteria=None):
+    executable = argv[0]
+    name = os.path.basename(executable).lower()
+    if executable in {'{python}','python','python3','py',sys.executable}:
+        command = [sys.executable,*argv[1:]]
+    elif name in {'node','node.exe','npm','npm.cmd','dotnet','dotnet.exe','go','go.exe','cargo','cargo.exe','java','java.exe'} and executable == name:
+        resolved = shutil.which(executable)
+        if not resolved:
+            raise ToolError('missing_runtime','Runtime is not installed: '+name)
+        command = [resolved,*argv[1:]]
+    else:
+        raise ToolError('unsupported_command','Use python/node/npm/dotnet/go/cargo/java; shell executables and Git are disabled.')
+    if any('\x00' in item for item in command):
+        raise ToolError('invalid_command','Command arguments must not contain NUL.')
+    # Reuse bounded output capture, timeout and process-tree cleanup already used by checks.
+    key = '__autodev_runtime__'
+    previous = repository.checks.get(key)
+    previous_timeout = repository.CHECK_TIMEOUT
+    repository.CHECK_TIMEOUT = timeout_seconds
+    def invoke(actual):
+        repository.checks[key]=actual
+        return repository.run_check(key)
+    try:
+        if purpose in {'verify','build'} and command[0]==sys.executable:
+            result=tracked_python(repository,command,invoke)
+        else:
+            result=invoke(command)
+            result['executed_project_files']=referenced_project_files(repository,argv) if purpose=='verify' else []
+            result['compiled_project_files']=referenced_project_files(repository,argv) if purpose=='build' else []
+        result['argv'] = argv
+        result['purpose']=purpose
+        result['criteria']=criteria or []
+        result['qualifies_as_verification']=bool(result['passed'] and purpose in {'build','verify'} and
+            (result['executed_project_files'] if purpose=='verify' else result['compiled_project_files']))
+        return result
+    finally:
+        repository.CHECK_TIMEOUT = previous_timeout
+        if previous is None:
+            repository.checks.pop(key,None)
+        else:
+            repository.checks[key] = previous

@@ -55,6 +55,8 @@ class DesktopLifecycle(unittest.IsolatedAsyncioTestCase):
                 }]},
                 {'role': 'assistant',
                  'content': '{"summary":"Saved","next_steps":"","done":true,"state":"complete"}'},
+                {'role': 'assistant',
+                 'content': '{"summary":"Reviewed saved file against the request","next_steps":"","done":true,"state":"complete","review":{"risks":[{"scenario":"Wrong saved text","evidence":"feature.txt contains Ready","basis":"code","status":"excluded"}],"gaps":[]}}'},
             ]):
                 result = await second.continue_task()
             self.assertEqual(result['status'], 'completed')

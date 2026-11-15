@@ -1,0 +1,21 @@
+{
+  "providers": {
+    "mimo": {
+      "api_key": "YOUR_MIMO_API_KEY",
+      "base_url": "https://api.xiaomimimo.com/v1"
+    },
+    "gpt": {
+      "api_key": "YOUR_GPT_API_KEY",
+      "base_url": ""
+    }
+  },
+  "roles": {
+    "writer": {
+      "provider": "mimo",
+      "model": "mimo-v2.6-pro",
+      "transport": "chat",
+      "thinking": "enabled",
+      "stream_reasoning": false
+    }
+  }
+}

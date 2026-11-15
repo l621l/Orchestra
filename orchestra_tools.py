@@ -25,6 +25,8 @@ def available_tools(settings, repository):
     result = list(FILE_TOOLS)
     for tool in GIT_TOOLS:
         name = tool['function']['name']
+        if name in {'apply_patch', 'git_create_branch'}:
+            continue
         if not options.get('git_tools_enabled', False) and name not in {'create_file','replace_text','run_check'}:
             continue
         if not repository.available and name not in WORKSPACE_TOOL_NAMES:

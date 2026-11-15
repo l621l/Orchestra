@@ -9,14 +9,15 @@ from tool_contracts import validate_arguments
 from tool_errors import ToolError
 from tool_schema import compact_tools
 from tools import FILE_TOOLS
-from tests import test_pipeline as fixtures
+from tests import test_single_model as fixtures
 
 
 class ToolSchema(unittest.IsolatedAsyncioTestCase):
-    setUp = fixtures.Alternating.setUp
-    call = fixtures.Alternating.call
+    setUp = fixtures.SingleModel.setUp
+    call = fixtures.SingleModel.call
 
     def test_defaults_exclude_git_even_with_git_flags_enabled(self):
+        self.app.settings['tools']['git_tools_enabled'] = False
         self.app.repository.available = True
         self.app.repository.checks = {'unit':['python','-V']}
         self.app.settings['tools'].update(git_history_enabled=True,allow_git_mutations=True)

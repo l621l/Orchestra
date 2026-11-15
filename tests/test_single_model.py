@@ -26,7 +26,7 @@ class SingleModel(unittest.IsolatedAsyncioTestCase):
         self.settings['checks'] = {'unit': ['{python}', '-B', '-c',
             "from pathlib import Path; assert Path('value.txt').read_text() == 'correct'"]}
         config = {'providers': {'offline': {}},
-                  'roles': {'worker': {'provider': 'offline', 'model': 'gpt-6-luna'}}}
+                  'roles': {'writer': {'provider': 'offline', 'model': 'mimo-v2.6-pro'}}}
         with patch('orchestra.BASE', self.root):
             self.app = Orchestra(config, self.root, self.settings,
                 json.loads((BASE/'prompts.json').read_text()), {})
@@ -168,8 +168,7 @@ class SingleModel(unittest.IsolatedAsyncioTestCase):
 
     def test_settings_reject_shell_strings_and_delegation(self):
         for update in [{'checks': {'test': 'python -m unittest'}},
-                       {'tools': {'editing_enabled':'yes'}},
-                       {'roles': {'worker': {'max_delegations':1}}}]:
+                       {'tools': {'editing_enabled':'yes'}}]:
             value = copy.deepcopy(self.settings)
             value.update(update)
             with self.assertRaises(ValueError):

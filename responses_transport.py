@@ -9,6 +9,7 @@ from openai import AsyncOpenAI
 async def receive_summary_stream(client, payload, trace, task_id, request_id):
     response = None
     fragments = []
+    editing_tools = {}
     stream = await client.responses.create(**payload, stream=True)
     try:
         async with stream as events:
@@ -17,6 +18,20 @@ async def receive_summary_stream(client, payload, trace, task_id, request_id):
                     fragments.append(event.delta)
                     trace.progress('reasoning', model=payload['model'], request_id=request_id,
                                    text=event.delta)
+                elif event.type == 'response.output_item.added':
+                    item = event.item
+                    if item.type == 'function_call' and item.name in {
+                        'create_file', 'replace_text', 'apply_patch',
+                    }:
+                        editing_tools[item.id] = item.name
+                elif event.type == 'response.output_text.delta' and event.delta:
+                    trace.progress('model_text', request_id=request_id,
+                                   item_id=event.item_id, text=event.delta)
+                elif event.type == 'response.function_call_arguments.delta' and event.delta:
+                    name = editing_tools.get(event.item_id)
+                    if name:
+                        trace.progress('edit_draft', request_id=request_id, item_id=event.item_id,
+                                       name=name, text=event.delta)
                 elif event.type in {'response.completed', 'response.incomplete', 'response.failed'}:
                     response = event.response
                 elif event.type == 'error':
@@ -65,8 +80,6 @@ def request_payload(app, role, messages, tools, resource_status, force_final=Fal
     }
     if settings['model'] == 'gpt-6.1-sol' and getattr(app, 'stream_responses_reasoning', False):
         payload['reasoning']['summary'] = 'auto'
-    if definitions and getattr(app, 'requires_plan_call', lambda: False)():
-        payload['tool_choice'] = 'required'
     return payload
 
 
@@ -138,7 +151,7 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
         if usage is None: entry['output_budget_estimated']=True
         app.dashboard.record_usage(label, entry)
         app.dashboard.update_output_budget(sum(v.get('output_budget_tokens',0) for v in turn_usage.values()),
-            app.settings['execution']['max_output_tokens_per_turn'],
+            None,
             estimated=any(v.get('output_budget_estimated',False) for v in turn_usage.values()))
         app.dashboard.update(label,trace.tasks[task_id]['depth'],'response received' if not error_type else 'request failed',
                              cost=app.estimated_cost(entry) if usage else None)

@@ -15,10 +15,6 @@ def describe_tool(name, args):
         detail = args.get('name', '')
     elif name == 'run_command':
         detail = ' '.join(args.get('argv',[]))
-    elif name == 'finish_task':
-        detail = args.get('id','')
-    elif name == 'set_plan':
-        detail = f"{len(args.get('tasks',[]))} tasks"
     elif name == 'git_show':
         detail = f"{args.get('revision', '')} {detail}"
     elif name == 'git_create_branch':

@@ -9,26 +9,24 @@ from urllib.parse import urlsplit
 from desktop_theme import BACKGROUND
 from interface_notes import atomic_text
 from model_routing import role_settings
-from orchestra_config import validate_settings
+from orchestra_config import validate_settings, normalize_settings
 
 
 LIMITS = (
-    ('pipeline', 'max_task_cost_usd', 'Порог расходов на задачу, USD', float, 0, 0.1),
+    ('direct', 'max_task_cost_usd', 'Порог расходов на задачу, USD', float, 0, 0.1),
     ('api', 'timeout_seconds', 'Тайм-аут API, сек.', float, 0, 180),
     ('execution', 'max_api_calls_per_turn', 'Вызовы API за запуск', int, 1, 300),
     ('execution', 'max_steps_per_agent', 'Шаги за запуск', int, 1, 100),
     ('generation', 'max_output_tokens', 'Выходные токены на запрос', int, 1, 131072),
-    ('pipeline', 'writer_request_characters', 'Размер запроса исполнителя, символы', int, 3000, 24000),
-    ('pipeline', 'strong_request_characters', 'Размер запроса эксперта, символы', int, 4000, 16000),
-    ('pipeline', 'no_progress_calls', 'Шаги без прогресса до восстановления', int, 1, 6),
-    ('pipeline', 'recovery_calls', 'Шаги восстановления', int, 1, 4),
+    ('direct', 'writer_request_characters', 'Размер запроса исполнителя, символы', int, 3000, 24000),
+    ('direct', 'no_progress_calls', 'Шаги без прогресса до восстановления', int, 1, 6),
+    ('direct', 'recovery_calls', 'Шаги восстановления', int, 1, 4),
 )
 
 DEFAULT_CONFIG = {
     'providers': {'mimo': {'api_key': '', 'base_url': 'https://api.xiaomimimo.com/v1'},
                   'gpt': {'api_key': '', 'base_url': ''}},
-    'roles': {'writer': {'provider': 'mimo', 'model': 'mimo-v2.6-pro'},
-              'strong': {'provider': 'gpt', 'model': 'gpt-6.1-sol'}},
+    'roles': {'writer': {'provider': 'mimo', 'model': 'mimo-v2.6-pro'}},
 }
 
 
@@ -37,9 +35,11 @@ class SettingsDialog:
         self.data = data
         self.on_saved = on_saved
         self.settings_path = data.root / 'settings.json'
-        self.settings = json.loads(self.settings_path.read_text(encoding='utf-8'))
+        self.settings = normalize_settings(json.loads(self.settings_path.read_text(encoding='utf-8')))
         self.config = (json.loads(data.config.read_text(encoding='utf-8'))
                        if data.config.exists() else copy.deepcopy(DEFAULT_CONFIG))
+        for name, provider in DEFAULT_CONFIG['providers'].items():
+            self.config['providers'].setdefault(name, copy.deepcopy(provider))
         self.window = tk.Toplevel(parent, background=BACKGROUND)
         self.window.title('Настройки Orchestra')
         self.window.transient(parent)
@@ -73,8 +73,8 @@ class SettingsDialog:
                   wraplength=440).grid(row=len(LIMITS), columnspan=2, sticky='w', pady=(8, 0))
         self.roles = {}
         catalog = json.loads((data.root / 'pricing.json').read_text(encoding='utf-8'))['providers']
-        for index, (role, title, default_transport) in enumerate(
-                (('writer', 'Исполнитель', 'chat'), ('strong', 'Эксперт', 'responses'))):
+        for index, (role, title) in enumerate(
+                (('writer', 'Исполнитель'),)):
             current = role_settings(self.config, role)
             row = index * 3
             self.roles[role] = {
@@ -83,8 +83,6 @@ class SettingsDialog:
                 'model': self.field(models, row + 1, title + ' · модель', current['model'],
                                     choices=tuple(catalog.get(current['provider'], {})) if role == 'writer' else None,
                                     editable=role == 'writer'),
-                'transport': self.field(models, row + 2, title + ' · API',
-                                        current.get('transport', default_transport), choices=('chat', 'responses')),
             }
             if role == 'writer':
                 writer = self.roles[role]
@@ -95,8 +93,6 @@ class SettingsDialog:
                     choices = tuple(catalog.get(provider, {}))
                     model_box.configure(values=choices)
                     writer['model'].set(choices[0] if choices else '')
-                    if provider in {'mimo', 'gpt'}:
-                        writer['transport'].set('chat' if provider == 'mimo' else 'responses')
 
                 writer['provider'].trace_add('write', update_writer_models)
         self.thinking = self.field(models, 6, 'Рассуждения MiMo',
@@ -170,10 +166,12 @@ class SettingsDialog:
             for role, fields in self.roles.items():
                 original = role_settings(self.config, role)
                 updated = {**original, **{key: field.get().strip() for key, field in fields.items()}}
+                updated.pop('transport', None)
                 if role == 'writer':
                     updated['thinking'] = self.thinking.get()
                     updated['stream_reasoning'] = self.stream_reasoning.get()
                 self.config['roles'][role] = updated
+                role_settings(self.config, role)
                 provider = self.config['providers'][updated['provider']]
                 if not updated['model']:
                     raise ValueError('Укажите модель для ' + updated['provider'] + '.')

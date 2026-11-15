@@ -2,11 +2,10 @@
 import argparse
 from pathlib import Path
 
-from autodev_console import format_status
-from autodev_intent import input_command
+from workspace_status import format_status
+from task_state import input_command
 from orchestra_app import OrchestraApp
 from orchestra_console import AgentDashboard, print_usage_summary
-from session_state import SessionState
 from workspace_lease import WorkspaceBusy
 
 
@@ -19,8 +18,8 @@ async def main(base):
         args.workspace.mkdir(exist_ok=True)
     app = OrchestraApp.from_directory(args.data_dir, args.workspace, dashboard=AgentDashboard())
     engine = app.engine
-    print(f"Pipeline workspace: {engine.files.root}")
-    for role in ("writer", "strong"):
+    print(f"Direct workspace: {engine.files.root}")
+    for role in ("writer",):
         settings = engine.role_settings(role)
         print(f"{role}: {settings['provider']} / {settings['model']}")
     while True:
@@ -43,18 +42,6 @@ async def main(base):
             text='N: '+payload
         if not text:
             continue
-        suggestion=SessionState.layout_suggestion(text)
-        if suggestion:
-            print('Похоже, включена неверная раскладка. Предполагаемый текст:')
-            print(suggestion)
-            try:
-                accepted=input('Использовать этот текст? [y/да, иначе введи заново]: ').strip().lower()
-            except (EOFError,KeyboardInterrupt):
-                break
-            if accepted not in {'y','yes','д','да'}:
-                print('Задание не отправлено в API.')
-                continue
-            text=suggestion
         try:
             result = await app.run(text)
         except WorkspaceBusy as error:

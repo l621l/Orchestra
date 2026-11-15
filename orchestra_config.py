@@ -6,10 +6,26 @@ from pathlib import Path
 
 def load_configuration(directory):
     directory = Path(directory)
-    return tuple(
+    config, settings, prompts, pricing = tuple(
         json.loads((directory / name).read_text(encoding='utf-8'))
         for name in ('config.local.json', 'settings.json', 'prompts.json', 'pricing.json')
     )
+    return config, normalize_settings(settings), prompts, pricing
+
+
+def normalize_settings(settings):
+    import copy
+    settings = copy.deepcopy(settings)
+    settings['direct'] = {k: v for k, v in settings.get('direct', settings.get('pipeline', {})).items()
+                          if k in {'writer_request_characters', 'no_progress_calls', 'recovery_calls',
+                                   'repeated_action_limit', 'max_task_cost_usd'}}
+    for key in ('pipeline', 'roles', 'reasoning_effort'):
+        settings.pop(key, None)
+    for key in ('completion_review_enabled', 'iterations_per_task', 'stop_after_confirmation',
+                'max_output_tokens_per_turn', 'final_output_reserve_tokens'):
+        settings.get('execution', {}).pop(key, None)
+    return settings
+
 
 
 def validate_settings(settings):
@@ -30,27 +46,15 @@ def validate_settings(settings):
             raise ValueError(f"Invalid settings: {section}.{name}")
     if set(settings["generation"]) != {"max_output_tokens"}:
         raise ValueError("Unexpected generation setting.")
-    for role in ("worker", "director", "writer", "tester"):
-        value = settings.get("roles", {}).get(role, {}).get("max_delegations", 0)
-        if type(value) is not int or value < 0 or value != 0:
-            raise ValueError(f"Invalid settings: roles.{role}.max_delegations")
-    if type(settings['execution'].get('stop_after_confirmation', True)) is not bool:
-        raise ValueError('stop_after_confirmation must be boolean.')
-    if type(settings['execution'].get('completion_review_enabled', True)) is not bool:
-        raise ValueError('completion_review_enabled must be boolean.')
     if type(settings['execution'].get('project_map_enabled',True)) is not bool:
         raise ValueError('project_map_enabled must be boolean.')
     map_limit=settings['execution'].get('project_map_context_characters',2500)
     if type(map_limit) is not int or not 1000 <= map_limit <= 16000:
         raise ValueError('project_map_context_characters must be between 1000 and 16000.')
-    for key in ('max_output_tokens_per_turn', 'final_output_reserve_tokens',
-                'research_calls_before_action', 'implementation_calls_reserve'):
+    for key in ('research_calls_before_action', 'implementation_calls_reserve'):
         value = settings['execution'].get(key, 4)
         if type(value) is not int or value < 1:
             raise ValueError(f'{key} must be a positive integer.')
-    iterations = settings['execution'].get('iterations_per_task', 5)
-    if type(iterations) is not int or not 1 <= iterations <= 20:
-        raise ValueError('iterations_per_task must be an integer from 1 to 20.')
     options = settings.get('tools', {})
     if (not isinstance(options, dict) or set(options) - {'editing_enabled', 'allow_git_mutations', 'git_history_enabled', 'git_tools_enabled'}
             or any(type(value) is not bool for value in options.values())):

@@ -2,7 +2,9 @@ import copy,json,unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from tests import test_direct_dev as fixtures
-from tests.test_responses_transport import Item
+class Item:
+    def __init__(self, **data): self.data = data
+    def model_dump(self, **kwargs): return copy.deepcopy(self.data)
 from writer_transport import request,wire_messages
 
 class MiMoContext(unittest.IsolatedAsyncioTestCase):
@@ -71,8 +73,3 @@ class MiMoContext(unittest.IsolatedAsyncioTestCase):
             if m.get('_reasoning_owner'):self.assertEqual(m['reasoning_content'],'thought '*250)
         ids={c['id'] for m in messages for c in m.get('tool_calls',[])}
         self.assertEqual(ids,{m['tool_call_id'] for m in messages if m['role']=='tool'})
-
-    def test_mimo_reasoning_is_not_passed_to_sol(self):
-        self.app.load_or_start('Develop program')
-        messages=[{'role':'user','content':'Develop program'}, {'role':'assistant','content':'Working','reasoning_content':'PRIVATE_REASONING','_reasoning_owner':'mimo/mimo-v2.6-pro'}]
-        self.assertNotIn('PRIVATE_REASONING',str(self.app.strong_context(messages)))

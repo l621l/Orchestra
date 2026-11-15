@@ -150,7 +150,7 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
             entry['output_budget_estimated'] = True
         app.dashboard.record_usage(label, entry)
         app.dashboard.update_output_budget(sum(x.get('output_budget_tokens',0) for x in turn_usage.values()),
-            app.settings['execution']['max_output_tokens_per_turn'],
+            None,
             estimated=any(x.get('output_budget_estimated',False) for x in turn_usage.values()))
         trace.record_request(task_id, request_id, getattr(response,'id',None), provider, config['model'],
             getattr(response,'model',None), time.monotonic()-started,

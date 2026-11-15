@@ -109,14 +109,3 @@ class CompletionGuard(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pool['calls'],0)
         self.assertEqual(self.app.request.await_count,1)
         self.assertEqual(result['status'],'partial')
-
-    async def test_continue_does_not_bypass_output_budget(self):
-        self.settings['execution']['max_output_tokens_per_turn']=20000
-        usage={}
-        async def request(*args,**kwargs):
-            usage['worker']={'output_budget_tokens':20000}
-            return self.progress_report()
-        self.app.request=request
-        result=await self.app.run('worker',[],{'calls':100},usage,self.trace,self.task)
-        self.assertEqual(result['stop_reason'],'output_budget')
-        self.assertEqual(result['status'],'partial')

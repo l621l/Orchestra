@@ -31,13 +31,9 @@ class AgentDashboard:
     def resolve_label(self, label):
         return (self.active_model or 'writer') if self.models and label == 'worker' else label
 
-    def activate_model(self, label, step, total, early=False, next_model=None):
-        if self.active_model and self.active_model != label:
-            self.finish(self.active_model, 'waiting', 'Waiting for next turn')
+    def activate_model(self, label='writer'):
         self.active_model = label
-        self.cycle = ('Expert on demand' if step is None else f'Step {step}/{total}') + (' (recovery)' if early else '')
-        if next_model:
-            self.cycle += ' | Next: '+next_model
+        self.cycle = 'Direct'
         self.update(label, activity='Preparing request')
 
     def record_usage(self, label, entry):
@@ -134,10 +130,10 @@ class AgentDashboard:
                           compact_tokens(state.get('input_tokens',0)), output, cost_text)
         if self.states:
             table.add_section()
-            tokens = f"{compact_tokens(self.output_used)}/{compact_tokens(self.output_limit)}"
+            tokens = compact_tokens(self.output_used)
             if self.output_estimated:
                 tokens = '~'+tokens
-            table.add_row("TOTAL", "", "Output budget (incl. reasoning)", "", str(total_calls),
+            table.add_row("TOTAL", "", "Output tokens (incl. reasoning)", "", str(total_calls),
                           compact_tokens(total_input), tokens,
                           f"${total_cost:.5f}" if known_costs else "-")
         return table

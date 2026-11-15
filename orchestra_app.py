@@ -2,7 +2,7 @@
 import asyncio
 from pathlib import Path
 
-from autodev_intent import TaskRequest, input_command
+from task_state import TaskRequest, input_command
 from direct_dev import DirectDevelopment
 from model_errors import error_description
 from orchestra_config import load_configuration
@@ -45,8 +45,6 @@ class OrchestraApp:
     async def continue_task(self, clarification='', *, on_progress=None):
         return await self._submit(TaskRequest('continue', clarification.strip()), on_progress=on_progress)
 
-    async def debug_task(self, text, *, on_progress=None):
-        return await self._submit(TaskRequest('debug', text.strip()), on_progress=on_progress)
 
     async def run(self, text, *, on_event=None):
         """Run a task and return its result, usage and trace path.
