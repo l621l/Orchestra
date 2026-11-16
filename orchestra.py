@@ -7,9 +7,10 @@ import time
 from pathlib import Path
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError
+from budget_git import PreparedPublication
 from model_routing import role_settings
 from tools import parse_arguments
-from model_errors import ModelResponseError, OutputLimitError, error_description
+from model_errors import ModelResponseError, OutputLimitError, TaskCostLimit, error_description
 from orchestra_config import validate_prompts, validate_settings
 from orchestra_progress import SilentProgress, describe_tool
 from orchestra_tools import available_tools, tool_handler, workspace_tools
@@ -95,6 +96,9 @@ class Orchestra:
         self.dashboard = SilentProgress() if dashboard is None else dashboard
         self.logs_path = BASE / "logs" if logs_path is None else Path(logs_path)
         self.logs_path.mkdir(parents=True, exist_ok=True)
+        from project_data import MAP, project_data_path
+        self.project_data = project_data_path(self.logs_path, self.files.root)
+        self.project_map.storage_target = self.project_data / MAP
 
 
     def role_settings(self, role):
@@ -201,11 +205,16 @@ class Orchestra:
         return state.can_commit(self.repository.checks)
 
     async def run(self, role, messages, budget, turn_usage, trace, task_id,
-                  max_calls=None, label=None):
+                  max_calls=None, label=None, publish_on_cost_stop=False,
+                  completion_review=False, output_limit=None):
         if role != 'worker':
             raise ValueError('tools-only runs one model; delegation is disabled.')
         label = label or role
         tools = self.available_tools()
+        names = {tool['function']['name'] for tool in tools}
+        publication = (PreparedPublication(self.repository, trace, task_id)
+                       if publish_on_cost_stop and {'prepare_commit', 'create_commit', 'git_push'} <= names
+                       else None)
         call_limit = min(max_calls or self.settings['execution']['max_steps_per_agent'],
                          self.settings['execution']['max_steps_per_agent'])
         state = TurnState()
@@ -218,7 +227,7 @@ class Orchestra:
         continuation_repeats = 0
         research_warning_sent = False
         reserve_warning_sent = False
-        implementation_requested = requires_implementation(messages)
+        implementation_requested = not completion_review and requires_implementation(messages)
 
         def result(answer, partial=False):
             return state.result(answer, self.repository.checks, partial=partial,
@@ -254,6 +263,8 @@ class Orchestra:
                 self.dashboard.action(label, 'Research checkpoint: focus on a concrete change or reproducing check.')
             prior = turn_usage.get(label, {})
             effective_output_limit = self.settings['generation']['max_output_tokens']
+            if output_limit is not None:
+                effective_output_limit = min(effective_output_limit, output_limit)
             resource_status = self.prompts['resource_status'].format(
                 shared_calls_after=budget['calls'] - 1, agent_calls_after=call_limit-step-1,
                 delegations_remaining=0, tools_available='no' if force_final else 'yes',
@@ -288,6 +299,11 @@ class Orchestra:
                 message = await self.request(role, messages, step_tools, resource_status,
                     turn_usage, trace, task_id, label, force_final,
                     max_output_tokens=effective_output_limit, **({"disable_thinking": True} if recovering_length else {}))
+            except TaskCostLimit as error:
+                if publication is None or not publication.plan:
+                    raise
+                detail = await publication.finish(state, self.can_commit(state))
+                raise TaskCostLimit(str(error) + detail) from error
             except (APIConnectionError, APIStatusError, TimeoutError) as error:
                 retryable = not isinstance(error, APIStatusError) or error.status_code >= 500
                 if (retryable and transient_retries < 2
@@ -409,6 +425,12 @@ class Orchestra:
                                               else 'call_limit' if force_final else 'report_budget_boundary')
                     return outcome
                 no_progress = implementation_requested and not state.changed and not state.checks and not blocker
+                if completion_review and not blocker:
+                    no_progress = result('')['verification']['status'] != 'passed'
+                    from completion_review import review_evidence_complete
+                    specification = (self._state or {}).get('specification', '')
+                    no_progress |= not review_evidence_complete(
+                        report.get('review') if isinstance(report, dict) else None, messages, specification)
                 unverified_edit = (self.requires_launch_verification()
                     and not blocker and isinstance(report, dict)
                     and report.get('done') is True
@@ -420,7 +442,11 @@ class Orchestra:
                     if not force_final and completion_repairs < 2 and budget['calls'] > 0:
                         completion_repairs += 1
                         messages.append({'role':'system','content':
-                            ('Completion rejected: run the current project after the latest edit and fix any failure. '
+                            ('Review incomplete: cover every requirement with evidence, mark gaps explicitly, '
+                             'and execute an independent targeted check after the latest edit. '
+                             'Report checks with exact argv, kind and outcome, and coverage with requirement, status and evidence. '
+                             if completion_review else
+                             'Completion rejected: run the current project after the latest edit and fix any failure. '
                              if unverified_edit else
                              'The answer was rejected: internal history is not a final report, and research alone '
                              'does not deliver an implementation request. Use current evidence to make a focused '
@@ -492,6 +518,14 @@ class Orchestra:
                         await operation
                         raise
                     state.record_result(name, args, value)
+                    if publication is not None and name == 'prepare_commit':
+                        publication.prepare(args, value, state, self.can_commit(state))
+                    elif publication is not None and name in {'run_check', 'run_command'}:
+                        publication.checked(
+                            value.get('passed') and self.can_commit(state)
+                            and not any(rev == state.revision and not ok for rev, ok in state.checks.values()))
+                    elif publication is not None and name in {'create_commit', 'git_push', 'git_pull'}:
+                        publication.plan = None
                     summary = self.tool_result_summary(name, value)
                     if name in EDIT_TOOL_NAMES:
                         summary = {key: value.get(key) for key in ('applied', 'files', 'files_changed', 'warnings', 'interface_memory')}

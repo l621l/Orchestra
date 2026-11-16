@@ -71,6 +71,7 @@ class ProjectMap:
         self.cache = {}
         self.notes = InterfaceNotes(policy)
         self.focus_paths = []
+        self.storage_target = None
 
     def refresh(self, context_limit=6000):
         records, skipped = [], 0
@@ -142,8 +143,10 @@ class ProjectMap:
         full = ''.join(full_parts)
         context = ''.join(compact_parts)
         if len(context)>context_limit:
-            context=context[:context_limit-150]+'\n[Map excerpt truncated. Read PROJECT_MAP.md or the specific source file for omitted interfaces.]'
-        target = self.policy.resolve_write('PROJECT_MAP.md')
+            context=context[:context_limit-150]+'\n[Map excerpt truncated. Inspect the specific source file for omitted interfaces.]'
+        target = self.storage_target or self.policy.resolve_write('PROJECT_MAP.md')
+        if self.storage_target:
+            target.parent.mkdir(parents=True, exist_ok=True)
         warning = note_warning
         written = False
         if target.exists() and not target.read_text(encoding='utf-8').startswith(HEADER):
@@ -158,7 +161,7 @@ class ProjectMap:
                     with tempfile.NamedTemporaryFile(dir=target.parent,prefix='.orchestra-map-',delete=False) as stream:
                         temporary=stream.name
                         stream.write(full.encode('utf-8'))
-                    if self.policy.resolve_write('PROJECT_MAP.md')!=target:
+                    if not self.storage_target and self.policy.resolve_write('PROJECT_MAP.md')!=target:
                         raise OSError('Map destination changed')
                     os.replace(temporary,target)
                     written=True
@@ -182,7 +185,7 @@ class ProjectMap:
         try:
             inventory=self.refresh()
             if inventory['warning']: warnings.append(inventory['warning'])
-            return {'updated':True,'revision':inventory['revision'], 'map_file':'PROJECT_MAP.md',
+            return {'updated':True,'revision':inventory['revision'], 'map_file':None if self.storage_target else 'PROJECT_MAP.md',
                     'notes_file':'INTERFACE_NOTES.json' if saved or inventory['notes_current'] or inventory['notes_stale'] else None,
                     'notes_saved':saved, 'notes_current':inventory['notes_current'],
                     'notes_stale':inventory['notes_stale'],'warnings':warnings}

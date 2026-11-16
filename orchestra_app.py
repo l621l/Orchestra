@@ -6,7 +6,7 @@ from task_state import TaskRequest, input_command
 from direct_dev import DirectDevelopment
 from model_errors import error_description
 from orchestra_config import load_configuration
-from project_usage import ensure_ignored, record_usage
+from project_usage import record_usage
 from turn_trace import TurnTrace
 from workspace_lease import WorkspaceBusy, workspace_lease
 from workspace_status import workspace_status
@@ -43,6 +43,9 @@ class OrchestraApp:
     async def new_task(self, text, *, on_progress=None):
         return await self._submit(TaskRequest('new', text.strip()), on_progress=on_progress)
 
+    async def review_task(self, text='', *, on_progress=None):
+        return await self._submit(TaskRequest('review', text.strip()), on_progress=on_progress)
+
     async def continue_task(self, clarification='', *, on_progress=None):
         return await self._submit(TaskRequest('continue', clarification.strip()), on_progress=on_progress)
 
@@ -57,7 +60,7 @@ class OrchestraApp:
 
     async def _submit(self, text, *, on_event=None, on_progress=None):
         action, payload = input_command(text)
-        if action in {'status', 'exit'} or (action != 'continue' and not payload):
+        if action in {'status', 'exit'} or (action not in {'continue', 'review'} and not payload):
             raise ValueError('Enter a development request.')
         if self.running:
             raise RuntimeError('This workspace session already has a running turn.')
@@ -79,11 +82,6 @@ class OrchestraApp:
         error_type = None
         usage_error = None
         try:
-            if (engine.files.root / '.git').exists():
-                try:
-                    ensure_ignored(engine.files.root)
-                except (OSError, ValueError) as error:
-                    usage_error = error
             trace.progress('started', topic=trace.topic)
             dashboard.start(trace.turn_id, trace.topic, output_limit=engine.total_output_limit)
             result = await engine.run_user_task(text, usage, trace, root_task)
@@ -126,8 +124,9 @@ class OrchestraApp:
                 }
                 if usage:
                     try:
-                        ensure_ignored(engine.files.root)
-                        record_usage(engine.files.root, list(usage.values()), costs)
+                        record_usage(engine.project_data, list(usage.values()), costs,
+                                     legacy_workspace=engine.files.root, task=description,
+                                     run_id=trace.turn_id, status=status)
                         usage_error = None
                     except (OSError, ValueError, KeyError, TypeError) as error:
                         usage_error = error

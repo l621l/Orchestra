@@ -17,12 +17,16 @@
   },
   "tools": {
     "editing_enabled": true,
-    "allow_git_mutations": false,
+    "allow_git_mutations": true,
+    "allow_git_push": true,
     "git_history_enabled": false,
-    "git_tools_enabled": false
+    "git_tools_enabled": true
   },
   "checks": {},
   "direct": {
+    "completion_review_enabled": true,
+    "completion_review_budget_percent": 20,
+    "completion_review_output_tokens": 8192,
     "writer_request_characters": 250000,
     "no_progress_calls": 6,
     "recovery_calls": 4,

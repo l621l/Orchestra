@@ -84,7 +84,7 @@ class GitGraph(QGraphicsView):
         self.setBackgroundBrush(QColor('#16181a'))
         rows, lanes = layout_commits(history)
         if not rows:
-            self.label('В репозитории пока нет коммитов.', 16, 24, '#e8eaf0')
+            self.label('This repository has no commits yet.', 16, 24, '#e8eaf0')
             return
 
         labels_x = 26 + lanes * LANE_WIDTH

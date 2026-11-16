@@ -31,7 +31,7 @@ def input_command(text):
 
 def continuation_intent(text,has_checkpoint):
     command,payload=input_command(text)
-    if command in {'new'}:return False,''
+    if command in {'new', 'review'}:return False,''
     if command=='continue':return True,payload
     return bool(has_checkpoint),payload if has_checkpoint else ''
 
@@ -41,7 +41,7 @@ def read_task(path, text):
     if command in {'status','exit'}:
         raise ModelResponseError('This is a local console command, not a development request.')
     saved=None
-    if path.is_file() and command not in {'new'}:
+    if path.is_file() and command not in {'new', 'review'}:
         saved=json.loads(path.read_text(encoding='utf-8'))
     active=bool(saved and saved.get('status')!='completed')
     continuing,clarification=continuation_intent(text,active)
@@ -50,12 +50,16 @@ def read_task(path, text):
 
 def new_task(files, path, command, payload):
     specification=payload
-    if not specification:
+    if not specification and command != 'review':
         raise ModelResponseError('Enter the task after N:.')
     spec=files.policy.resolve_write('what_to_do.md')
     if spec.is_file():
         if spec.stat().st_size>100000:raise ModelResponseError('what_to_do.md exceeds 100000 bytes.')
-        specification+='\nWorkspace specification (user instruction takes priority):\n'+spec.read_text(encoding='utf-8')
+        workspace_spec = spec.read_text(encoding='utf-8')
+        if workspace_spec.strip():
+            specification += '\nWorkspace specification (user instruction takes priority):\n' + workspace_spec
+    if not specification.strip():
+        raise ModelResponseError('Enter review requirements or add what_to_do.md to the workspace.')
     if len(specification)>120000:raise ModelResponseError('Specification exceeds 120000 characters.')
     if path.is_file():
         archive=path.parent / 'autodev_history'

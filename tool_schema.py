@@ -14,7 +14,7 @@ DESCRIPTIONS = {
     'git_status':'Read Git status.', 'git_diff':'Read tracked diff.',
     'git_log':'Read commit history.', 'git_show':'Read a commit.',
     'git_create_branch':'Create and switch to a new branch; call alone.',
-    'prepare_commit':'Inspect changes and get commit fingerprint.',
+    'prepare_commit':'Inspect changes and get a fingerprint. For a user-requested commit and push, include reviewed paths and message to allow finalization at the spending limit.',
     'create_commit':'Commit prepared files; requires checks; call alone.',
 }
 

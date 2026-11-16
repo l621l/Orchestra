@@ -25,6 +25,8 @@ class DesktopLifecycle(unittest.IsolatedAsyncioTestCase):
                     json.loads((base / name).read_text(encoding='utf-8'))
                     for name in ('settings.json', 'prompts.json', 'pricing.json')
                 ]
+                settings['checks'] = {'saved_text': ['{python}', '-c',
+                    'from pathlib import Path; assert Path("feature.txt").read_text() == "Ready"']}
                 return OrchestraApp(DirectDevelopment(config, folder, settings, prompts, pricing,
                                                         logs_path=folder / 'logs'))
 
@@ -46,6 +48,9 @@ class DesktopLifecycle(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(second.status()['stop_reason'], 'cancelled')
             first.engine._state['budget_spent'] = first.engine.options['max_task_cost_usd'] + 1
             first.engine.save_state()
+            (folder / 'verify_feature.py').write_text(
+                'from pathlib import Path\nassert Path("feature.txt").read_text() == "Ready"\n',
+                encoding='utf-8')
             with patch('writer_transport.request', side_effect=[
                 {'role': 'assistant', 'tool_calls': [{
                     'id': 'edit', 'type': 'function', 'function': {
@@ -55,8 +60,14 @@ class DesktopLifecycle(unittest.IsolatedAsyncioTestCase):
                 }]},
                 {'role': 'assistant',
                  'content': '{"summary":"Saved","next_steps":"","done":true,"state":"complete"}'},
+                {'role': 'assistant', 'tool_calls': [{
+                    'id': 'verify', 'type': 'function', 'function': {
+                        'name': 'run_check', 'arguments': '{"name":"saved_text"}'}}]},
                 {'role': 'assistant',
-                 'content': '{"summary":"Reviewed saved file against the request","next_steps":"","done":true,"state":"complete","review":{"risks":[{"scenario":"Wrong saved text","evidence":"feature.txt contains Ready","basis":"code","status":"excluded"}],"gaps":[]}}'},
+                 'tool_calls': [{'id': 'independent', 'type': 'function', 'function': {
+                     'name': 'run_command', 'arguments': '{"argv":["{python}","verify_feature.py"]}'}}]},
+                {'role': 'assistant',
+                 'content': '{"summary":"Reviewed saved file against the request","next_steps":"","done":true,"state":"complete","review":{"findings":[],"checks":[{"argv":["{python}","verify_feature.py"],"kind":"independent","outcome":"passed"}],"coverage":[{"requirement":"Make a small app","status":"verified","evidence":"feature.txt checked by verify_feature.py"}],"limitations":[]}}'},
             ]):
                 result = await second.continue_task()
             self.assertEqual(result['status'], 'completed')

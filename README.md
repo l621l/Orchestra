@@ -1,5 +1,84 @@
 # Orchestra — Direct
 
+## Development routes
+
+Direct now runs a finite sequence of blocks: `implement -> review` by default.
+`development_route.py` defines the block interface, registry and route runner;
+`completion_review.py` owns the fresh-context review prompt, execution and report.
+Both blocks use the existing runtime, tools and shared task cost guard.
+An incomplete block stops the route. There is no automatic review loop.
+
+Optional settings under `direct`:
+
+```json
+{
+  "route": ["implement", "review"],
+  "completion_review_budget_percent": 20,
+  "completion_review_output_tokens": 8192
+}
+```
+
+Use `["implement"]` to run implementation alone. If `route` is omitted,
+`completion_review_enabled` (default true) selects whether to include review.
+Explicit routes take precedence. Unknown or repeated blocks are rejected.
+To add a block, implement `run(context, previous)` returning the standard task
+result and register it in `BLOCKS`. The runner controls sequencing and stopping;
+each block owns its context and limits. This is a code/configuration interface,
+not a graphical route editor.
+
+Review receives the requirements, clarifications, implementation report, changed
+paths and bounded edit-diff excerpts (including edits already committed). It must
+inspect current files where excerpts are insufficient, reproduce suspected bugs,
+fix confirmed defects and verify the latest revision. A completion claim without
+a successful tool-executed check is rejected. Implementation's forced-edit rule
+remains active; review does not require unnecessary edits.
+
+Review now reports `coverage` per requirement (one entry per ID), with `verified`,
+`unverified` or `unmet` status and concrete evidence. It must inspect gaps in the
+existing tests and execute an independent targeted check. Reported command arguments
+are matched to successful tool results after the latest edit; missing coverage or
+baseline-only reports cannot pass. This checks evidence structure, not the semantic
+quality of the model's tests. Review can commit and push verified fixes when those
+options are enabled under Settings > Git.
+Implementation can use the full task allowance. Review uses the remaining funds
+up to 20% of `max_task_cost_usd` by default. Change the percentage under Settings > Limits.
+Old review call limits are removed when loading configuration; global call/step
+limits remain as loop protection. The output ceiling per review request is 8192,
+further reduced using remaining funds and an input-cost estimate with a margin.
+Each request tells the model its stage allowance, spend, remaining funds, estimated
+input cost and approximate number of requests at 2048 output tokens each.
+Reasoning tokens count as output. Tokenization/cache estimates can differ from
+actual billing, so this is not an exact provider-enforced dollar cap.
+If an API response omits usage, the remaining stage allowance is conservatively
+reserved and marked estimated, preventing unmetered calls from repeating for free.
+Stage spend persists across interruptions. Explicit continuation after a budget
+stop starts a fresh allocation, matching the existing task-budget reset behavior.
+Budget exhaustion leaves the task partial. Reports and stage statuses are
+saved in task state, trace and the local project journal; no `VALIDATION.md` is
+automatically created. A resumed partial task starts the route again against the
+current files. Review uses fresh messages and defaults to the executor's model.
+Choose a separate provider and model under Settings → Limits, or set
+`roles.reviewer` in the connection configuration. The selected reviewer needs
+its own pricing entry. Its charges count toward the shared task budget.
+
+The application stores the live map, journal and cumulative usage under
+`logs/projects/<project-id>/`. The ID is derived from the canonical workspace
+path and stays the same across branch switches in that folder. Model rates remain
+in the application's `pricing.json`. Existing workspace usage is imported on
+the next metered run. When switching branches in the desktop app, recognized
+legacy journal and map edits are backed up before restoring their tracked copies.
+Orchestra commits a repository copy of `PROJECT_MAP.md` generated from the
+staged Python sources. It refreshes that copy only when creating a commit and
+preserves a user-authored map.
+
+Reasoning effort is selected separately under Settings > Models (executor) and
+Settings > Limits (reviewer). `Same as executor` inherits the executor's effort.
+The role configuration stores `reasoning_effort`; `default` omits the API effort
+parameter rather than forcing `low`. Known GPT models expose their supported
+levels; unknown models and providers without supported effort controls disable
+the selector and omit the parameter. MiMo retains its existing thinking toggle.
+Capability reference: https://developers.openai.com/api/docs/guides/deployment-checklist
+
 Выбранная модель читает проект, меняет файлы, запускает проверки и продолжает
 задачу в одном диалоге. Плановый пайплайн, эксперт, отдельный режим отладки и финальный ревьюер удалены.
 Для исправления ошибки достаточно обычной задачи в Direct.
@@ -17,16 +96,18 @@ py -B orchestra.py --workspace "C:\path\to\project"
 
 GUI:
 
-```cmd
-py -B orchestra_desktop.py
-```
-
 Окно на PySide6 можно запустить отдельно. Оно использует те же настройки и историю проектов.
 
 ```sh
 python -m pip install -r requirements-qt.txt
 python -B orchestra_qt.py
 ```
+
+On Ubuntu or Debian (including WSL), run `bash start-linux.sh` from the repository.
+The launcher installs missing system packages via APT, prepares a Python virtual
+environment, and opens the desktop app. APT may ask for your sudo password.
+For commits, configure `git config user.name` and `git config user.email` in
+your project. Pushing to GitHub also requires credentials in the Linux environment.
 
 GUI хранит настройки в `%LOCALAPPDATA%\Orchestra`. Через настройки можно задать
 модель, ключ, лимиты и доступ к Git. Старые настройки `pipeline`
@@ -87,7 +168,7 @@ Git-инструменты включаются в настройках. Сох�
 - `task_state.py`, `context_history.py`, `workspace_status.py` — продолжение и статус.
 - `runtime_tools.py` — запуск команд и фактические свидетельства выполнения кода.
 - `tools.py`, `git_tools.py` — операции с проектом.
-- `orchestra_app.py`, `orchestra_cli.py`, `orchestra_desktop.py` — интерфейсы запуска.
+- `orchestra_app.py`, `orchestra_cli.py`, `orchestra_qt.py` — интерфейсы запуска.
 
 ```cmd
 py -B -m unittest discover -q

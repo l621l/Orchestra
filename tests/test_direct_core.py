@@ -1,6 +1,9 @@
 import copy
 import io
 import json
+import shutil
+import subprocess
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -17,6 +20,66 @@ from tests import test_direct_dev as fixtures
 class DirectCore(unittest.IsolatedAsyncioTestCase):
     setUp = fixtures.DirectLoop.setUp
     call = fixtures.DirectLoop.call
+
+    @unittest.skipUnless(shutil.which('git'), 'Git is required')
+    async def test_cost_stop_publishes_verified_group_and_preserves_preexisting_edit(self):
+        from direct_dev import DirectDevelopment
+
+        def git(folder, *args):
+            return subprocess.run(['git', '-C', str(folder), *args], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        topic = 'Create main.py. Commit and push after verification.'
+        with tempfile.TemporaryDirectory() as remote:
+            git(remote, 'init', '--bare', '-q')
+            git(self.root, 'init', '-q', '-b', 'main')
+            git(self.root, 'config', 'user.name', 'Test')
+            git(self.root, 'config', 'user.email', 'test@example.invalid')
+            git(self.root, 'remote', 'add', 'origin', remote)
+            user_file = self.root / 'user.txt'
+            user_file.write_text('original', encoding='utf-8')
+            (self.root / '.gitignore').write_text(
+                'PROJECT_MAP.md\nORCHESTRA_JOURNAL.jsonl\nINTERFACE_NOTES.json\nignored.txt\n',
+                encoding='utf-8')
+            git(self.root, 'add', 'user.txt', '.gitignore')
+            git(self.root, 'commit', '-qm', 'Baseline')
+            user_file.write_text('user edit', encoding='utf-8')
+            (self.root / 'unrelated.py').write_text('def uncommitted_only(): pass\n', encoding='utf-8')
+            (self.root / 'ignored.txt').write_text('private', encoding='utf-8')
+            (self.root / 'INTERFACE_NOTES.json').write_text(
+                '{"managed_by":"orchestra.interface_notes.v1","notes":[]}', encoding='utf-8')
+            settings = copy.deepcopy(self.app.settings)
+            settings['tools'].update(git_tools_enabled=True, allow_git_mutations=True, allow_git_push=True)
+            settings['execution']['project_map_enabled'] = True
+            settings['checks'] = {}
+            app = DirectDevelopment(self.app.config, self.root, settings, self.app.prompts,
+                                    self.app.pricing, logs_path=self.app.logs_path)
+            app.settings['tools']['allow_git_push'] = False
+            names = {tool['function']['name'] for tool in app.available_tools()}
+            self.assertNotIn('git_push', names)
+            self.assertIn('create_commit', names)
+            self.assertNotIn('git_push', app.git_prompt_suffix())
+            self.assertIn('create_commit', app.git_prompt_suffix())
+            app.settings['tools']['allow_git_push'] = True
+            app.request = AsyncMock(side_effect=[
+                self.call('create_file', path='main.py', content='print("hello")\n'),
+                self.call('run_command', argv=['{python}', 'main.py']),
+                self.call('prepare_commit', paths=['main.py'], message='Add main program'),
+                TaskCostLimit('Budget reached.'),
+            ])
+            result = await app.run_user_task(topic, {}, self.trace, self.parent)
+            self.assertIn('pushed to origin/main', result['answer'])
+            self.assertEqual(git(remote, 'rev-parse', 'refs/heads/main'), git(self.root, 'rev-parse', 'HEAD'))
+            self.assertEqual(git(self.root, 'show', 'HEAD:user.txt'), 'original')
+            self.assertEqual(user_file.read_text(encoding='utf-8'), 'user edit')
+            self.assertEqual(set(git(self.root, 'show', '--format=', '--name-only', 'HEAD').splitlines()),
+                             {'main.py', 'INTERFACE_NOTES.json', 'PROJECT_MAP.md'})
+            stage_map = git(remote, 'show', 'refs/heads/main:PROJECT_MAP.md')
+            self.assertIn('main.py', stage_map)
+            self.assertNotIn('unrelated.py', stage_map)
+            self.assertEqual(git(self.root, 'status', '--porcelain', '--', 'PROJECT_MAP.md'), '')
+            self.assertFalse((self.root / 'ORCHESTRA_JOURNAL.jsonl').exists())
+            self.assertTrue(app.journal_path.is_file())
 
     def test_direct_validates_model_transport(self):
         for model, transport in [('gpt-6.1-sol', 'chat'),
@@ -43,8 +106,10 @@ class DirectCore(unittest.IsolatedAsyncioTestCase):
             yield SimpleNamespace(type='response.completed', response=response)
 
         first = AsyncMock()
+        metering = SimpleNamespace(model_dump=lambda: {
+            'input_tokens': 100, 'output_tokens': 100, 'total_tokens': 200})
         first.__aenter__.return_value = events(
-            SimpleNamespace(id='first', model='gpt-6.1-sol', usage=None,
+            SimpleNamespace(id='first', model='gpt-6.1-sol', usage=metering,
                             status='completed', output=[item], output_text=''),
             'Проверяю структуру проекта')
         summary_item = SimpleNamespace(
@@ -54,7 +119,7 @@ class DirectCore(unittest.IsolatedAsyncioTestCase):
         )
         last = AsyncMock()
         last.__aenter__.return_value = events(
-            SimpleNamespace(id='final', model='gpt-6.1-sol', usage=None,
+            SimpleNamespace(id='final', model='gpt-6.1-sol', usage=metering,
                             status='completed', output=[summary_item], output_text=json.dumps({
                                 'summary': 'Created', 'done': True, 'state': 'complete',
                             })))

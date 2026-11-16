@@ -4,6 +4,21 @@ import math
 from pathlib import Path
 
 
+def completion_review_enabled(direct):
+    route = direct.get('route')
+    return 'review' in route if isinstance(route, list) else direct.get('completion_review_enabled', True)
+
+
+def set_completion_review(direct, enabled):
+    direct['completion_review_enabled'] = enabled
+    route = direct.get('route')
+    if isinstance(route, list):
+        if enabled and 'review' not in route:
+            route.append('review')
+        elif not enabled and 'review' in route:
+            route.remove('review')
+
+
 def load_configuration(directory):
     directory = Path(directory)
     config, settings, prompts, pricing = tuple(
@@ -18,7 +33,14 @@ def normalize_settings(settings):
     settings = copy.deepcopy(settings)
     settings['direct'] = {k: v for k, v in settings.get('direct', settings.get('pipeline', {})).items()
                           if k in {'writer_request_characters', 'no_progress_calls', 'recovery_calls',
-                                   'repeated_action_limit', 'max_task_cost_usd'}}
+                                   'repeated_action_limit', 'max_task_cost_usd',
+                                   'completion_review_enabled', 'completion_review_calls',
+                                   'completion_review_output_tokens', 'completion_review_instructions',
+                                   'completion_review_policy_version', 'completion_review_budget_percent', 'route'}}
+    direct = settings['direct']
+    direct.pop('completion_review_calls', None)
+    direct.pop('completion_review_policy_version', None)
+    direct.setdefault('completion_review_budget_percent', 20)
     for key in ('pipeline', 'roles', 'reasoning_effort'):
         settings.pop(key, None)
     for key in ('completion_review_enabled', 'iterations_per_task', 'stop_after_confirmation',
@@ -56,7 +78,7 @@ def validate_settings(settings):
         if type(value) is not int or value < 1:
             raise ValueError(f'{key} must be a positive integer.')
     options = settings.get('tools', {})
-    if (not isinstance(options, dict) or set(options) - {'editing_enabled', 'allow_git_mutations', 'git_history_enabled', 'git_tools_enabled'}
+    if (not isinstance(options, dict) or set(options) - {'editing_enabled', 'allow_git_mutations', 'allow_git_push', 'git_history_enabled', 'git_tools_enabled'}
             or any(type(value) is not bool for value in options.values())):
         raise ValueError('tools settings must contain supported boolean flags.')
     checks = settings.get('checks', {})

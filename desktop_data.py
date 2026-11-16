@@ -3,7 +3,9 @@ import json
 import os
 import shutil
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
+from desktop_options import DEFAULT_CONFIG
 from interface_notes import atomic_text
 
 
@@ -28,24 +30,72 @@ class DesktopData:
         return ((self.source / 'config.local.json').is_file()
                 or (self.source / 'logs').is_dir())
 
+    def initialize_connection(self):
+        try:
+            with self.config.open('x', encoding='utf-8') as stream:
+                json.dump(DEFAULT_CONFIG, stream, ensure_ascii=False, indent=2)
+        except FileExistsError:
+            pass
+
     def import_legacy(self):
         for name in ('config.local.json', 'settings.json', 'prompts.json', 'pricing.json'):
             original = self.source / name
             target = self.root / name
-            if original.is_file() and (not target.exists() or name != 'config.local.json'):
+            if original.is_file() and (
+                not target.exists() or name != 'config.local.json' or self.has_default_connection()
+            ):
                 atomic_text(target, original.read_text(encoding='utf-8'))
         previous = self.source / 'logs'
-        if previous.is_dir():
-            for original in previous.rglob('*'):
-                if original.is_symlink() or not original.is_file() or original.suffix == '.tmp':
-                    continue
-                target = self.logs / original.relative_to(previous)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    with target.open('xb') as stream:
-                        stream.write(original.read_bytes())
-                except FileExistsError:
-                    continue
+        if previous.is_dir() and not self.logs.resolve().is_relative_to(previous.resolve()):
+            self.import_logs(previous)
+
+    def import_logs(self, previous):
+        pending = [(previous, self.logs)]
+        while pending:
+            folder, destination = pending.pop()
+            try:
+                existing = set(os.listdir(destination))
+                ready = True
+            except FileNotFoundError:
+                existing = set()
+                ready = False
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    name = entry.name
+                    # Older versions stored project snapshots alongside the logs.
+                    if folder == previous and (name == 'verified_runs' or name.startswith('before-')):
+                        continue
+                    if name.endswith('.tmp'):
+                        continue
+                    target = destination / name
+                    if entry.is_dir(follow_symlinks=False):
+                        if not getattr(entry, 'is_junction', lambda: False)():
+                            pending.append((Path(entry.path), target))
+                    elif name not in existing and entry.is_file(follow_symlinks=False):
+                        if not ready:
+                            destination.mkdir(parents=True, exist_ok=True)
+                            ready = True
+                        self.copy_log(entry.path, target)
+
+    @staticmethod
+    def copy_log(original, target):
+        temporary = None
+        try:
+            with open(original, 'rb') as source, NamedTemporaryFile(
+                dir=target.parent, suffix='.tmp', delete=False
+            ) as stream:
+                temporary = Path(stream.name)
+                shutil.copyfileobj(source, stream)
+            os.replace(temporary, target)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def has_default_connection(self):
+        try:
+            return json.loads(self.config.read_text(encoding='utf-8')) == DEFAULT_CONFIG
+        except (OSError, ValueError):
+            return False
 
     def load_preferences(self):
         try:

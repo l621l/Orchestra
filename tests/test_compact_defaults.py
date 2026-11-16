@@ -17,6 +17,7 @@ class CompactDefaults(unittest.IsolatedAsyncioTestCase):
 
 
     def test_git_history_and_commit_preparation_are_opt_in(self):
+        self.settings['tools']['allow_git_mutations'] = False
         self.app.repository.available=True
         names={t['function']['name'] for t in self.app.available_tools()}
         self.assertTrue({'git_status','git_diff'}<=names)

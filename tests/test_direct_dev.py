@@ -38,6 +38,7 @@ class DirectLoop(unittest.IsolatedAsyncioTestCase):
         tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup);self.root=Path(tmp.name)
         base=Path(__file__).resolve().parents[1]
         settings=json.loads((base/'settings.json').read_text())
+        settings['direct']['completion_review_enabled'] = False
         config={'providers':{'mimo':{},'gpt':{}},'roles':{'writer':{'provider':'mimo','model':'mimo-v2.6-pro'},'strong':{'provider':'gpt','model':'gpt-6.1-sol'}}}
         with patch('orchestra.BASE',self.root):
             self.app=DirectDevelopment(config,self.root,settings,json.loads((base/'prompts.json').read_text()),json.loads((base/'pricing.json').read_text()))
@@ -136,7 +137,9 @@ class DirectLoop(unittest.IsolatedAsyncioTestCase):
     async def test_read_only_loop_stops_after_bounded_recovery(self):
         observed=[]
         async def respond(app,role,*args,**kwargs):
-            observed.append(role);cfg=app.role_settings(role);app.begin_usage(args[3],role,role,cfg['provider'],cfg['model'])
+            observed.append(role);cfg=app.role_settings(role)
+            entry = app.begin_usage(args[3],role,role,cfg['provider'],cfg['model'])
+            app.add_usage(entry, {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}, None)
             if role=='strong':return {'role':'assistant','content':'Implement one pending feature using the source already inspected; do not rescan.'}
             return self.call('list_files',path='.')
         with patch('writer_transport.request',side_effect=respond):
@@ -144,5 +147,5 @@ class DirectLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'],'partial')
         self.assertLessEqual(len(observed),10)
         self.assertEqual(set(observed), {'writer'})
-        self.assertIn('Изменений нет.', result['answer'])
-        self.assertIn('без прогресса', result['stop_reason'])
+        self.assertIn('No changes made.', result['answer'])
+        self.assertIn('without progress', result['stop_reason'])

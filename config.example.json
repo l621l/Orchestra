@@ -6,7 +6,22 @@
     },
     "gpt": {
       "api_key": "YOUR_GPT_API_KEY",
-      "base_url": ""
+      "base_url": "https://api.openai.com/v1"
+    },
+    "claude": {
+      "api_key": "YOUR_CLAUDE_API_KEY",
+      "base_url": "https://api.anthropic.com/v1/",
+      "transport": "chat"
+    },
+    "deepseek": {
+      "api_key": "YOUR_DEEPSEEK_API_KEY",
+      "base_url": "https://api.deepseek.com/v1",
+      "transport": "chat"
+    },
+    "qwen": {
+      "api_key": "YOUR_QWEN_API_KEY",
+      "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+      "transport": "chat"
     }
   },
   "roles": {

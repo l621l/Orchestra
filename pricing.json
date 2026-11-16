@@ -29,6 +29,26 @@
         "input_cache_write": 0.125,
         "output": 0.5
       }
+    },
+    "claude": {
+      "claude-sonnet-4-6": {
+        "input_cache_miss": 3,
+        "input_cache_hit": 0.3,
+        "input_cache_write": 3.75,
+        "output": 15
+      },
+      "claude-opus-4-6": {
+        "input_cache_miss": 5,
+        "input_cache_hit": 0.5,
+        "input_cache_write": 6.25,
+        "output": 25
+      },
+      "claude-haiku-4-5-20251001": {
+        "input_cache_miss": 1,
+        "input_cache_hit": 0.1,
+        "input_cache_write": 1.25,
+        "output": 5
+      }
     }
   },
   "sources": {
@@ -36,7 +56,10 @@
       "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
       "https://developers.openai.com/api/docs/models/gpt-6-luna"
     ],
-    "mimo": "https://mimo.mi.com/docs/pricing"
+    "mimo": "https://mimo.mi.com/docs/pricing",
+    "claude": "https://platform.claude.com/docs/en/about-claude/pricing",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
+    "qwen": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
   },
-  "notes": "Standard text API rates in USD per 1M tokens. MiMo rates retained. Excludes long-context, regional and service-tier surcharges."
+  "notes": "Standard text API rates in USD per 1M tokens. MiMo rates retained. Excludes long-context, regional and service-tier surcharges. Claude reference rates use 5-minute cache writes."
 }

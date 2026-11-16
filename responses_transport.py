@@ -82,13 +82,15 @@ def request_payload(app, role, messages, tools, resource_status, force_final=Fal
         'model': settings['model'],
         'input': input_items(messages) + [{'role': 'system', 'content': instructions}],
         'tools': definitions,
-        'reasoning': {'effort': app.settings.get('reasoning_effort', 'low')},
         'max_output_tokens': max_output_tokens or app.settings['generation']['max_output_tokens'],
         'store': False,
         'include': ['reasoning.encrypted_content'],
     }
+    effort = settings.get('reasoning_effort', 'default')
+    if effort != 'default':
+        payload['reasoning'] = {'effort': effort}
     if settings['model'].lower() == 'gpt-6.1-sol' and settings.get('stream_reasoning', True):
-        payload['reasoning']['summary'] = 'auto'
+        payload.setdefault('reasoning', {})['summary'] = 'auto'
     return payload
 
 
@@ -103,7 +105,7 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
         app.validate_request_input(role, payload)
     wire, definitions = payload['input'], payload['tools']
     cap = payload['max_output_tokens']
-    effort = payload['reasoning']['effort']
+    effort = payload.get('reasoning', {}).get('effort', 'default')
     entry=app.begin_usage(turn_usage,label,role,provider_name,settings['model'])
     if provider_name not in app.clients:
         provider=app.config['providers'][provider_name]
@@ -114,11 +116,11 @@ async def request(app, role, messages, tools, resource_status, turn_usage, trace
              'messages':len(wire),'tools_available':len(definitions),'forced_final':force_final,
              'input_characters':len(json.dumps(wire, ensure_ascii=False)),
              'tool_schema_characters':len(json.dumps(definitions, ensure_ascii=False))}
-    metrics['reasoning_summary'] = payload['reasoning'].get('summary')
+    metrics['reasoning_summary'] = payload.get('reasoning', {}).get('summary')
     app.dashboard.update(label,trace.tasks[task_id]['depth'],'waiting for '+settings['model']+' / Responses')
     try:
         client = app.clients[provider_name]
-        if 'summary' in payload['reasoning']:
+        if 'summary' in payload.get('reasoning', {}):
             response = await receive_summary_stream(client, payload, trace, task_id, request_id)
         else:
             response = await client.responses.create(**payload)

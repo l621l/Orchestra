@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, Mock
 
 from orchestra_app import OrchestraApp
 from orchestra_progress import SilentProgress
-from project_usage import IGNORE_RULE, read_usage
+from project_data import project_data_path
+from project_usage import read_usage
 from workspace_lease import WorkspaceBusy
 
 
@@ -20,6 +21,7 @@ class ApplicationTurns(unittest.IsolatedAsyncioTestCase):
         self.engine = SimpleNamespace(
             files=SimpleNamespace(root=self.root),
             logs_path=self.root,
+            project_data=project_data_path(self.root, self.root),
             state_path=self.root / 'checkpoint.json',
             total_output_limit=20000,
             dashboard=SilentProgress(),
@@ -89,13 +91,14 @@ class ApplicationTurns(unittest.IsolatedAsyncioTestCase):
         second.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await second
-        data = read_usage(self.root)
+        data = read_usage(self.engine.project_data)
         self.assertEqual(data['runs'], 2)
         self.assertEqual(data['total']['estimated_usd'], 0.375)
         self.assertEqual(data['total']['cached_tokens'], 60)
         self.assertEqual({entry['model']: entry['estimated_usd'] for entry in data['models']},
                          {'sol': 0.25, 'other': 0.125})
-        self.assertEqual(ignore.read_text(encoding='utf-8').splitlines(), ['/private', IGNORE_RULE])
+        self.assertEqual(ignore.read_bytes(), b'/private')
+        self.assertEqual(read_usage(self.root)['runs'], 0)
 
     async def test_cancel_closes_trace_and_releases_session(self):
         started = asyncio.Event()

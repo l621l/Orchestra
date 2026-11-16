@@ -147,6 +147,7 @@ class SingleModel(unittest.IsolatedAsyncioTestCase):
         self.assertIn('at most 5', outputs[0]['message'])
 
     def test_git_mutations_opt_in_and_non_git_workspaces(self):
+        self.settings['tools']['allow_git_mutations'] = False
         names = {t['function']['name'] for t in self.app.available_tools()}
         self.assertIn('create_file', names)
         self.assertNotIn('git_log', names)

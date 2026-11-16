@@ -7,7 +7,8 @@ import re
 import signal
 import difflib
 from tool_errors import ToolError
-from project_map import ProjectMap
+from project_map import HEADER, ProjectMap
+from interface_notes import FILE as NOTES_FILE, InterfaceNotes, atomic_text
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -56,7 +57,10 @@ GIT_TOOLS = [
     definition("git_create_branch", "Create and switch to a NEW local branch from the current HEAD, including before the first commit. Call alone before implementation when branch creation is enabled by runtime policy. Preserves working files; refuses an existing branch or pre-existing staged changes. Cannot switch to an existing branch, reset history, merge, or push.",
                {"name": {"type": "string", "minLength": 1, "maxLength": 120,
                          "description": "New local branch name, for example feat/task-ledger."}}, ["name"]),
-    definition("prepare_commit", "Read-only: inspect changed paths, staged-change state, a bounded tracked diff, and a snapshot fingerprint. Read new files separately. Group related whole-file changes into one meaningful commit. Re-run after every edit or commit.", {}, []),
+    definition("prepare_commit", "Inspect changed paths and get a fingerprint. Optional paths and message identify the verified group to commit and push if the user requested publication and the spending limit stops the run.", {
+        "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "message": {"type": "string", "minLength": 1, "maxLength": 2000},
+    }, []),
     definition("create_commit", "Create one local commit from the latest prepare_commit fingerprint and selected whole-file paths. Available only when Git mutations are enabled; requires successful configured checks after the latest edit. Refuses stale snapshots, pre-existing staged changes, or unprepared paths. Call alone after edits and checks. Never pushes or merges.",
                {"message": {"type": "string", "description": "Concise commit subject and optional body describing the completed change."},
                 "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1,
@@ -119,7 +123,7 @@ class RepositoryTools:
             raise ToolError('git_disabled', 'Git tools are disabled.')
         environment = os.environ.copy()
         environment.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat",
-                            "GIT_TERMINAL_PROMPT": "0"})
+                            "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"})
         try:
             result = subprocess.run(
                 ["git", "--literal-pathspecs", "-C", str(self.root), *arguments],
@@ -170,22 +174,55 @@ class RepositoryTools:
         output = self._run(arguments)["stdout"]
         return [path for path in output.split("\0") if path]
 
-    def git_push(self):
+    def _push_refs(self, expected_head=None):
         self._require_repository()
         branch = self._run(['branch', '--show-current'])['stdout'].strip()
         if not branch:
             raise ToolError('detached_head', 'Select a local branch before pushing.')
+        if expected_head is not None and self._run(
+                ['rev-parse', '--verify', f'refs/heads/{branch}'])['stdout'].strip() != expected_head:
+            raise ToolError('stale_commit_plan', 'The current branch tip changed before push.')
         remote = self._run(['config', '--get', f'branch.{branch}.remote'], check=False)['stdout'].strip()
         target = self._run(['config', '--get', f'branch.{branch}.merge'], check=False)['stdout'].strip()
         if bool(remote) != bool(target) or remote == '.' or (target and not target.startswith('refs/heads/')):
             raise ToolError('invalid_upstream', 'Configure a remote branch as the upstream before pushing.')
         destination = target or f'refs/heads/{branch}'
         source = f'refs/heads/{branch}'
-        result = self._run(['push', '--no-follow-tags', '--set-upstream', '--',
-                            remote or 'origin', f'{source}:{destination}'], check=False)
+        return branch, remote or 'origin', source, destination
+
+    @staticmethod
+    def _check_push_result(result):
         if result['returncode']:
+            detail = result['stderr'].lower()
+            if any(marker in detail for marker in (
+                'could not read username', 'could not read password', 'terminal prompts disabled',
+                'authentication failed', 'invalid username or token', 'permission denied (publickey)',
+                'write access to repository not granted', 'returned error: 403',
+            )):
+                raise ToolError('push_auth_required',
+                                'Git could not authenticate or the account lacks write access. '
+                                'Sign in to the remote in this environment and try again.')
+            if any(marker in detail for marker in ('non-fast-forward', 'fetch first')):
+                raise ToolError('push_non_fast_forward',
+                                'The remote branch has changes. Sync the branch before pushing.')
             raise ToolError('push_failed', 'Git rejected the push. Check the remote, access, and branch history.')
-        return {'pushed': True, 'branch': branch, 'remote': remote or 'origin', 'destination': destination}
+
+    def check_push(self):
+        _, remote, source, destination = self._push_refs()
+        if self._run(['remote', 'get-url', '--push', '--', remote], check=False)['returncode']:
+            raise ToolError('push_remote_missing', 'Set the project’s push remote before starting.')
+        if self._run(['rev-parse', '--verify', source], check=False)['returncode']:
+            raise ToolError('push_no_commit', 'Git needs a first commit before Orchestra can check the push.')
+        result = self._run(['push', '--dry-run', '--no-verify', '--no-follow-tags', '--',
+                            remote, f'{source}:{destination}'], check=False)
+        self._check_push_result(result)
+
+    def git_push(self, *, expected_head=None):
+        branch, remote, source, destination = self._push_refs(expected_head)
+        result = self._run(['push', '--no-follow-tags', '--set-upstream', '--',
+                            remote, f'{source}:{destination}'], check=False)
+        self._check_push_result(result)
+        return {'pushed': True, 'branch': branch, 'remote': remote, 'destination': destination}
 
     def git_pull(self):
         self._require_repository()
@@ -358,6 +395,21 @@ class RepositoryTools:
         return {'name': name, 'returncode': process.returncode,
                 'passed': process.returncode == 0, **diagnostic}
 
+    def _managed_commit_files(self):
+        managed = []
+        for path in (NOTES_FILE,):
+            if not self.policy.allows_relative(path, write=True):
+                continue
+            target = self.policy.resolve_write(path)
+            if not target.is_file() or (self.policy.root / path).is_symlink():
+                continue
+            try:
+                InterfaceNotes(self.policy).load()
+            except (ValueError, OSError):
+                continue
+            managed.append(path)
+        return managed
+
     def _commit_snapshot(self):
         self._require_repository()
         head = self._run(["rev-parse", "--verify", "HEAD"], check=False)
@@ -388,30 +440,44 @@ class RepositoryTools:
             paths.append(safe_path)
             if code == "??":
                 untracked.add(safe_path)
+        managed = self._managed_commit_files()
+        if managed:
+            ignored = self._run(["ls-files", "--others", "--ignored", "--exclude-standard",
+                                 "-z", "--", *managed])["stdout"].split("\0")
+            for path in ignored:
+                if path in managed and path not in paths:
+                    entries.append(f"?? {path}")
+                    paths.append(path)
+                    untracked.add(path)
         paths = list(dict.fromkeys(paths))
+        managed_paths = [path for path in managed if path in paths]
+        visible_paths = [path for path in paths if path not in managed_paths]
         if not paths:
             raise ToolError("nothing_to_commit", "No accessible workspace changes are available to commit.")
         base = ["HEAD"] if head_id is not None else ["--cached"]
         full_diff = self._run(["diff", *base, "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color",
-                               "--binary", "--", *paths])["stdout"]
+                               "--binary", "--", *visible_paths])["stdout"] if visible_paths else ""
         digest = hashlib.sha256()
         digest.update((str(head_id) + "\0" + branch + "\0").encode("utf-8"))
         digest.update("\n".join(entries).encode("utf-8") + b"\0")
         digest.update(full_diff.encode("utf-8"))
-        for path in sorted(untracked):
+        for path in sorted(untracked | set(managed_paths)):
             target = self.policy.resolve_write(path)
             digest.update(b"\0" + path.encode("utf-8") + b"\0")
             if target.is_file():
                 digest.update(target.read_bytes())
         shown_diff, truncated = self._bounded(full_diff)
-        return {"fingerprint": digest.hexdigest(), "paths": paths,
+        return {"fingerprint": digest.hexdigest(), "paths": visible_paths,
+                "managed_paths": managed_paths,
                 "head": head_id,
-                "status": "\n".join(entries) + "\n",
+                "status": "\n".join(entry for entry in entries if entry[3:] not in managed_paths) + "\n",
                 "staged_changes_present": staged_present,
                 "diff": shown_diff, "diff_truncated": truncated}
 
-    def prepare_commit(self):
-        return self._commit_snapshot()
+    def prepare_commit(self, paths=None, message=None):
+        snapshot = self._commit_snapshot()
+        snapshot.pop("managed_paths")
+        return snapshot
 
     def git_create_branch(self, name):
         self._require_repository()
@@ -436,6 +502,24 @@ class RepositoryTools:
         return {'created': True, 'branch': name, 'previous_branch': previous,
                 'status': status, 'warnings': warnings}
 
+    def _map_for_index(self):
+        entries = self._run(['ls-files', '--stage', '-z'])['stdout'].split('\0')
+        paths = []
+        for entry in filter(None, entries):
+            metadata, name = entry.split('\t', 1)
+            if (metadata.split()[0] in {'100644', '100755'}
+                    and name.endswith('.py') and self.policy.allows_relative(name, write=False)):
+                paths.append(name)
+        paths.sort(key=lambda name: (name.startswith('tests/') or Path(name).name.startswith('test_'), name))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            if paths:
+                selected = paths[:self.interface_map.max_files + 1]
+                self._run(['checkout-index', '--prefix=' + root.as_posix() + '/', '-z', '--stdin'],
+                          input_text='\0'.join(selected) + '\0')
+            ProjectMap(WorkspacePolicy(root), max_files=self.interface_map.max_files).refresh()
+            return (root / 'PROJECT_MAP.md').read_text(encoding='utf-8')
+
     def create_commit(self, message, paths, fingerprint):
         self._require_repository()
         if (not isinstance(message, str) or not message.strip() or len(message) > 2000
@@ -455,25 +539,53 @@ class RepositoryTools:
             raise ToolError("staged_changes_present",
                             "Resolve pre-existing staged changes before automated commits.")
         safe_paths = list(dict.fromkeys(self._relative_path(path) for path in paths))
-        if not set(safe_paths).issubset(snapshot["paths"]):
+        managed = snapshot["managed_paths"]
+        if not set(safe_paths).issubset([*snapshot["paths"], *managed]):
             raise ToolError("invalid_commit_paths",
                             "Every commit path must belong to the prepared snapshot.")
+        ordinary = [path for path in safe_paths if path not in managed]
+        safe_paths = ordinary + managed
         for identity in ('GIT_AUTHOR_IDENT', 'GIT_COMMITTER_IDENT'):
             if self._run(['var', identity], check=False)['returncode']:
                 raise ToolError('git_identity_missing', 'Git author/committer identity is unavailable. Ask the user to configure user.name and user.email; no files were staged.')
+        map_target = None
+        previous_map = None
+        map_written = False
         try:
-            self._run(["add", "-A", "--", *safe_paths])
+            if ordinary:
+                self._run(["add", "-A", "--", *ordinary])
+            if managed:
+                self._run(["add", "-f", "--", *managed])
             staged = set(self._changed_paths(staged=True))
             if not staged:
                 raise ToolError("nothing_to_commit", "Selected paths contain no committable changes.")
             if staged != set(safe_paths):
                 raise ToolError("index_changed", "Staged paths differ from the prepared group. Inspect the index and prepare again.")
+            if self.interface_memory_enabled and self.interface_map.storage_target is not None:
+                if not (self.root / 'PROJECT_MAP.md').is_symlink():
+                    target = self.policy.resolve_write('PROJECT_MAP.md')
+                    previous_map = target.read_bytes() if target.exists() else None
+                    if previous_map is None or previous_map.startswith(HEADER.encode('utf-8')):
+                        map_target = target
+                        content = self._map_for_index()
+                        if previous_map != content.encode('utf-8'):
+                            atomic_text(target, content)
+                            map_written = True
+                        self._run(['add', '-f', '--', 'PROJECT_MAP.md'])
+                        if 'PROJECT_MAP.md' in self._changed_paths(staged=True) and 'PROJECT_MAP.md' not in safe_paths:
+                            safe_paths.append('PROJECT_MAP.md')
             self._run(["commit", "-m", message.strip()])
-        except ToolError:
+        except (ToolError, OSError, ValueError):
+            reset_paths = list(dict.fromkeys([*safe_paths, *(['PROJECT_MAP.md'] if map_target else [])]))
             if snapshot["head"] is None:
-                self._run(["rm", "--cached", "-q", "-f", "--", *safe_paths], check=False)
+                self._run(["rm", "--cached", "-q", "-f", "--", *reset_paths], check=False)
             else:
-                self._run(["reset", "-q", "HEAD", "--", *safe_paths], check=False)
+                self._run(["reset", "-q", "HEAD", "--", *reset_paths], check=False)
+            if map_written:
+                if previous_map is None:
+                    map_target.unlink()
+                else:
+                    map_target.write_bytes(previous_map)
             raise
         # The commit succeeded. Failure to describe it must not invite a retry.
         commit, summary, remaining, warnings = None, None, None, []
