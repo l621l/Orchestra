@@ -2,9 +2,9 @@ import copy
 import json
 import unittest
 
-from completion_review import review_evidence_complete
-from model_routing import role_settings, reasoning_levels
-from responses_transport import request_payload
+from orchestra_core.runtime.completion_review import review_evidence_complete
+from orchestra_core.models.model_routing import role_settings, reasoning_levels
+from orchestra_core.models.responses_transport import request_payload
 from types import SimpleNamespace
 
 
@@ -45,7 +45,7 @@ class ReviewEvidenceTests(unittest.TestCase):
 
 class ReasoningTests(unittest.TestCase):
     def test_legacy_review_budget_migrates_to_percentage(self):
-        from orchestra_config import normalize_settings
+        from orchestra_core.runtime.orchestra_config import normalize_settings
         old = {'direct': {'completion_review_calls': 4, 'max_task_cost_usd': 1}}
         current = normalize_settings(old)
         self.assertEqual(current['direct']['completion_review_budget_percent'], 20)

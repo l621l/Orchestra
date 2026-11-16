@@ -4,11 +4,11 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from git_tools import GIT_TOOLS, RepositoryTools
-from tool_contracts import validate_arguments
-from tool_errors import ToolError
-from tool_schema import compact_tools
-from tools import FILE_TOOLS
+from orchestra_core.workspace.git_tools import GIT_TOOLS, RepositoryTools
+from orchestra_core.workspace.tool_contracts import validate_arguments
+from orchestra_core.workspace.tool_errors import ToolError
+from orchestra_core.workspace.tool_schema import compact_tools
+from orchestra_core.workspace.tools import FILE_TOOLS
 from tests import test_single_model as fixtures
 
 
@@ -46,7 +46,7 @@ class ToolSchema(unittest.IsolatedAsyncioTestCase):
             validate_arguments(edit,{'path':'a.py','old_text':'a'})
 
     def test_disabled_repository_does_not_invoke_git_for_init_or_edits(self):
-        with tempfile.TemporaryDirectory() as directory, patch('git_tools.subprocess.run',side_effect=AssertionError('Git must not run')):
+        with tempfile.TemporaryDirectory() as directory, patch('orchestra_core.workspace.git_tools.subprocess.run',side_effect=AssertionError('Git must not run')):
             repo = RepositoryTools(directory,git_enabled=False)
             self.assertFalse(repo.available)
             self.assertTrue(repo.create_file('value.txt','before')['applied'])

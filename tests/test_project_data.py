@@ -4,9 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from project_data import JOURNAL, MAP, preserve_legacy_checkout_changes, project_data_path
-from project_map import HEADER
-from project_usage import FILENAME, read_usage, record_usage
+from orchestra_core.workspace.project_data import JOURNAL, MAP, preserve_legacy_checkout_changes, project_data_path
+from orchestra_core.workspace.project_map import HEADER
+from orchestra_core.workspace.project_usage import FILENAME, read_usage, record_usage
 
 
 class ProjectDataTests(unittest.TestCase):

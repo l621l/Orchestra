@@ -2,7 +2,7 @@
 import copy
 import json
 import time
-from model_errors import ModelResponseError, OutputLimitError, error_description
+from orchestra_core.models.model_errors import ModelResponseError, OutputLimitError, error_description
 from openai import AsyncOpenAI
 
 

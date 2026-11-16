@@ -2,11 +2,11 @@
 import argparse
 from pathlib import Path
 
-from workspace_status import format_status
-from task_state import input_command
-from orchestra_app import OrchestraApp
-from orchestra_console import AgentDashboard, print_usage_summary
-from workspace_lease import WorkspaceBusy
+from orchestra_core.runtime.workspace_status import format_status
+from orchestra_core.runtime.task_state import input_command
+from orchestra_core.runtime.orchestra_app import OrchestraApp
+from orchestra_core.console.orchestra_console import AgentDashboard, print_usage_summary
+from orchestra_core.workspace.workspace_lease import WorkspaceBusy
 
 
 async def main(base):

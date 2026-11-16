@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from git_tools import RepositoryTools
-from tool_errors import ToolError
+from orchestra_core.workspace.git_tools import RepositoryTools
+from orchestra_core.workspace.tool_errors import ToolError
 
 class CommitTools(unittest.TestCase):
     def setUp(self):

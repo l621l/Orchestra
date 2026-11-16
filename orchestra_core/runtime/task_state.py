@@ -6,7 +6,7 @@ import shutil
 import uuid
 from datetime import datetime, timezone
 
-from model_errors import ModelResponseError
+from orchestra_core.models.model_errors import ModelResponseError
 
 
 @dataclass(frozen=True)

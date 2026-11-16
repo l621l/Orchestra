@@ -15,7 +15,7 @@ except ModuleNotFoundError as error:
         raise
     QApplication = None
 
-from desktop_data import DesktopData
+from orchestra_core.desktop.desktop_data import DesktopData
 
 
 @unittest.skipIf(QApplication is None, 'Install requirements-qt.txt for Qt tests')
@@ -23,7 +23,7 @@ class QtDesktopTests(unittest.TestCase):
     def test_opening_click_release_does_not_select_a_combo_item(self):
         from PySide6.QtCore import QEvent, QPointF, Qt
         from PySide6.QtGui import QMouseEvent
-        from qt_settings import SettingsComboBox
+        from orchestra_core.desktop.qt_settings import SettingsComboBox
 
         combo = SettingsComboBox()
         combo.addItems(['First', 'Second'])
@@ -68,7 +68,7 @@ class QtDesktopTests(unittest.TestCase):
                 dialog.writer_provider.setCurrentText('gpt')
                 dialog.model.setCurrentText('gpt-6.1-sol')
                 self.assertEqual(dialog.writer_effort.currentText(), 'medium')
-                with patch('qt_settings.QMessageBox.warning') as warning:
+                with patch('orchestra_core.desktop.qt_settings.QMessageBox.warning') as warning:
                     dialog.save()
                     warning.assert_not_called()
                 roles = json.loads(data.config.read_text(encoding='utf-8'))['roles']
@@ -87,8 +87,8 @@ class QtDesktopTests(unittest.TestCase):
 
     def test_project_settings_isolate_models_limits_debug_and_git(self):
         import json
-        from orchestra_app import OrchestraApp
-        from project_data import SETTINGS, project_data_path
+        from orchestra_core.runtime.orchestra_app import OrchestraApp
+        from orchestra_core.workspace.project_data import SETTINGS, project_data_path
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -213,7 +213,7 @@ class QtDesktopTests(unittest.TestCase):
     def test_git_graph_selects_commit_under_label(self):
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtTest import QTest
-        from qt_git_graph import CommitRow, GitGraph, layout_commits
+        from orchestra_core.desktop.qt_git_graph import CommitRow, GitGraph, layout_commits
 
         history = '\n'.join('\0'.join(row) for row in (
             ('merge', 'left right', 'm', ' (HEAD -> main)', 'Merge work'),

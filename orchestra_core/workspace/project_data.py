@@ -4,8 +4,8 @@ import json
 import os
 from pathlib import Path
 
-from interface_notes import atomic_text
-from project_map import HEADER
+from orchestra_core.workspace.interface_notes import atomic_text
+from orchestra_core.workspace.project_map import HEADER
 
 JOURNAL = 'ORCHESTRA_JOURNAL.jsonl'
 MAP = 'PROJECT_MAP.md'

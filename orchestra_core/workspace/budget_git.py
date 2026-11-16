@@ -2,8 +2,8 @@
 import asyncio
 import re
 
-from model_errors import error_description
-from tool_errors import ToolError
+from orchestra_core.models.model_errors import error_description
+from orchestra_core.workspace.tool_errors import ToolError
 
 
 def requested_publication(text):

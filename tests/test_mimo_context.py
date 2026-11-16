@@ -5,7 +5,7 @@ from tests import test_direct_dev as fixtures
 class Item:
     def __init__(self, **data): self.data = data
     def model_dump(self, **kwargs): return copy.deepcopy(self.data)
-from writer_transport import request,wire_messages
+from orchestra_core.models.writer_transport import request,wire_messages
 
 class MiMoContext(unittest.IsolatedAsyncioTestCase):
     setUp=fixtures.DirectLoop.setUp

@@ -6,11 +6,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from orchestra_app import OrchestraApp
-from orchestra_progress import SilentProgress
-from project_data import project_data_path
-from project_usage import read_usage
-from workspace_lease import WorkspaceBusy
+from orchestra_core.runtime.orchestra_app import OrchestraApp
+from orchestra_core.runtime.orchestra_progress import SilentProgress
+from orchestra_core.workspace.project_data import project_data_path
+from orchestra_core.workspace.project_usage import read_usage
+from orchestra_core.workspace.workspace_lease import WorkspaceBusy
 
 
 class ApplicationTurns(unittest.IsolatedAsyncioTestCase):

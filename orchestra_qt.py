@@ -24,17 +24,17 @@ from PySide6.QtWidgets import (
     QTabWidget, QTreeView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from desktop_data import DesktopData
-from interface_notes import atomic_text
-from orchestra_app import OrchestraApp
-from orchestra_config import completion_review_enabled, normalize_settings, project_configuration, set_completion_review
-from tool_errors import ToolError
-from project_usage import IGNORE_RULE, read_usage
-from project_data import SETTINGS, preserve_legacy_checkout_changes, project_data_path
-from qt_git_graph import GitGraph
-from qt_settings import SettingsDialog
-from qt_statistics import UsageDialog
-from workspace_lease import workspace_lease
+from orchestra_core.desktop.desktop_data import DesktopData
+from orchestra_core.workspace.interface_notes import atomic_text
+from orchestra_core.runtime.orchestra_app import OrchestraApp
+from orchestra_core.runtime.orchestra_config import completion_review_enabled, normalize_settings, project_configuration, set_completion_review
+from orchestra_core.workspace.tool_errors import ToolError
+from orchestra_core.workspace.project_usage import IGNORE_RULE, read_usage
+from orchestra_core.workspace.project_data import SETTINGS, preserve_legacy_checkout_changes, project_data_path
+from orchestra_core.desktop.qt_git_graph import GitGraph
+from orchestra_core.desktop.qt_settings import SettingsDialog
+from orchestra_core.desktop.qt_statistics import UsageDialog
+from orchestra_core.workspace.workspace_lease import workspace_lease
 
 
 PROJECT_GITIGNORE = f"""# Local Orchestra data

@@ -1,5 +1,5 @@
 """Edit and verification state for a single model run."""
-from tool_contracts import EDIT_TOOL_NAMES
+from orchestra_core.workspace.tool_contracts import EDIT_TOOL_NAMES
 
 
 class TurnState:

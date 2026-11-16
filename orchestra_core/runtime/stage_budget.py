@@ -2,7 +2,7 @@
 import json
 import math
 
-from model_errors import TaskCostLimit
+from orchestra_core.models.model_errors import TaskCostLimit
 
 
 def allowance(options, review_enabled, reviewing):

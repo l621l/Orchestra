@@ -3,10 +3,10 @@ from dataclasses import dataclass
 from typing import Protocol
 import time
 
-from budget_git import requested_publication
-from completion_review import CompletionReviewBlock
-from orchestra import parse_task_report
-from task_state import input_command
+from orchestra_core.workspace.budget_git import requested_publication
+from orchestra_core.runtime.completion_review import CompletionReviewBlock
+from orchestra_core.runtime.engine import parse_task_report
+from orchestra_core.runtime.task_state import input_command
 
 
 @dataclass

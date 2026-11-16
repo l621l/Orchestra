@@ -2,7 +2,7 @@
 import time
 import json
 from types import SimpleNamespace
-from model_errors import OutputLimitError, ModelResponseError, error_description
+from orchestra_core.models.model_errors import OutputLimitError, ModelResponseError, error_description
 from openai import AsyncOpenAI
 
 

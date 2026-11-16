@@ -1,7 +1,7 @@
 import json
 import unittest
 from unittest.mock import AsyncMock
-from orchestra import is_internal_report
+from orchestra_core.runtime.engine import is_internal_report
 from tests import test_single_model as fixtures
 
 

@@ -2,4 +2,4 @@ config.local.json
 logs/
 __pycache__/
 .venv/
-workspace/
+/workspace/

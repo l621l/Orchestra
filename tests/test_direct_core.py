@@ -10,10 +10,10 @@ from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
-from model_errors import TaskCostLimit
-from model_routing import role_settings
-from orchestra_config import normalize_settings
-from orchestra_console import AgentDashboard
+from orchestra_core.models.model_errors import TaskCostLimit
+from orchestra_core.models.model_routing import role_settings
+from orchestra_core.runtime.orchestra_config import normalize_settings
+from orchestra_core.console.orchestra_console import AgentDashboard
 from tests import test_direct_dev as fixtures
 
 
@@ -23,7 +23,7 @@ class DirectCore(unittest.IsolatedAsyncioTestCase):
 
     @unittest.skipUnless(shutil.which('git'), 'Git is required')
     async def test_cost_stop_publishes_verified_group_and_preserves_preexisting_edit(self):
-        from direct_dev import DirectDevelopment
+        from orchestra_core.runtime.direct_dev import DirectDevelopment
 
         def git(folder, *args):
             return subprocess.run(['git', '-C', str(folder), *args], check=True,
@@ -172,7 +172,7 @@ class DirectCore(unittest.IsolatedAsyncioTestCase):
         self.app.load_or_start('Create program')
         self.app._state['budget_spent'] = self.app.options['max_task_cost_usd'] + 1
         self.app.save_state()
-        with patch('writer_transport.request', new_callable=AsyncMock) as request:
+        with patch('orchestra_core.models.writer_transport.request', new_callable=AsyncMock) as request:
             with self.assertRaises(TaskCostLimit):
                 await self.app.request('worker', [], [], '', {}, self.trace, self.parent)
             request.assert_not_called()

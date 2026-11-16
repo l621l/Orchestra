@@ -2,10 +2,10 @@ import json
 from unittest.mock import AsyncMock, patch
 
 from tests import test_direct_core as fixtures
-from model_errors import TaskCostLimit
-from development_route import validate_route
+from orchestra_core.models.model_errors import TaskCostLimit
+from orchestra_core.runtime.development_route import validate_route
 import unittest
-from task_state import TaskRequest
+from orchestra_core.runtime.task_state import TaskRequest
 
 
 class CompletionReview(unittest.IsolatedAsyncioTestCase):
@@ -39,7 +39,7 @@ class CompletionReview(unittest.IsolatedAsyncioTestCase):
     def test_review_git_prompt_matches_available_tools(self):
         definitions = [{'function': {'name': name}} for name in
                        ('git_status', 'git_diff', 'prepare_commit', 'create_commit', 'git_pull', 'git_push')]
-        with patch('orchestra.Orchestra.available_tools', return_value=definitions):
+        with patch('orchestra_core.runtime.engine.Orchestra.available_tools', return_value=definitions):
             self.app._review_active = True
             names = {tool['function']['name'] for tool in self.app.available_tools()}
             self.assertIn('automatically using git_push', self.app.git_prompt_suffix())
@@ -136,7 +136,7 @@ class CompletionReview(unittest.IsolatedAsyncioTestCase):
                                  check, self.report()]))
         reviewer = transport(iter([check, self.report(True)]))
         usage = {}
-        with patch('writer_transport.request', writer), patch('responses_transport.request', reviewer):
+        with patch('orchestra_core.models.writer_transport.request', writer), patch('orchestra_core.models.responses_transport.request', reviewer):
             result = await self.app.run_user_task('Create main.py', usage, self.trace, self.parent)
         self.assertEqual(result['status'], 'completed')
         self.assertEqual(writer.await_count, 3)

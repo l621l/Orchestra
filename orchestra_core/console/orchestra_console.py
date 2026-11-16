@@ -8,8 +8,8 @@ from rich.live import Live
 from rich.table import Table
 from rich.text import Text
 
-from orchestra_progress import clean, describe_tool
-from tool_contracts import EDIT_TOOL_NAMES
+from orchestra_core.runtime.orchestra_progress import clean, describe_tool
+from orchestra_core.workspace.tool_contracts import EDIT_TOOL_NAMES
 
 
 class AgentDashboard:

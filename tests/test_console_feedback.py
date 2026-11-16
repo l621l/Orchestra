@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from rich.console import Console
-from orchestra import AgentDashboard, ModelResponseError, error_description
+from orchestra_core.runtime.engine import AgentDashboard, ModelResponseError, error_description
 from tests import test_single_model as fixtures
 
 

@@ -2,10 +2,10 @@
 import copy
 import sys
 
-from git_tools import GIT_TOOLS, GIT_TOOL_NAMES, WORKSPACE_TOOL_NAMES, RepositoryTools
-from tool_contracts import EDIT_TOOL_NAMES
-from tool_schema import compact_tools
-from tools import FILE_TOOLS, ProjectTools
+from orchestra_core.workspace.git_tools import GIT_TOOLS, GIT_TOOL_NAMES, WORKSPACE_TOOL_NAMES, RepositoryTools
+from orchestra_core.workspace.tool_contracts import EDIT_TOOL_NAMES
+from orchestra_core.workspace.tool_schema import compact_tools
+from orchestra_core.workspace.tools import FILE_TOOLS, ProjectTools
 
 
 def workspace_tools(workspace, settings):

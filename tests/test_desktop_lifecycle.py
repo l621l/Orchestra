@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from orchestra_app import OrchestraApp
+from orchestra_core.runtime.orchestra_app import OrchestraApp
 
 
 class DesktopLifecycle(unittest.IsolatedAsyncioTestCase):
@@ -12,7 +12,7 @@ class DesktopLifecycle(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary:
             folder = Path(temporary)
             base = Path(__file__).resolve().parents[1]
-            from direct_dev import DirectDevelopment
+            from orchestra_core.runtime.direct_dev import DirectDevelopment
 
             def open_session():
                 config = {'providers': {'mimo': {}, 'gpt': {}}, 'roles': {
@@ -37,7 +37,7 @@ class DesktopLifecycle(unittest.IsolatedAsyncioTestCase):
                 started.set()
                 await asyncio.Future()
 
-            with patch('writer_transport.request', side_effect=pending):
+            with patch('orchestra_core.models.writer_transport.request', side_effect=pending):
                 task = asyncio.create_task(first.new_task('Make a small app'))
                 await asyncio.wait_for(started.wait(), timeout=5)
                 task.cancel()
@@ -51,7 +51,7 @@ class DesktopLifecycle(unittest.IsolatedAsyncioTestCase):
             (folder / 'verify_feature.py').write_text(
                 'from pathlib import Path\nassert Path("feature.txt").read_text() == "Ready"\n',
                 encoding='utf-8')
-            with patch('writer_transport.request', side_effect=[
+            with patch('orchestra_core.models.writer_transport.request', side_effect=[
                 {'role': 'assistant', 'tool_calls': [{
                     'id': 'edit', 'type': 'function', 'function': {
                         'name': 'create_file',

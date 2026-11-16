@@ -1,6 +1,6 @@
 """One path policy shared by read, search, Git, and patch tools."""
 from pathlib import Path
-from tool_errors import ToolError
+from orchestra_core.workspace.tool_errors import ToolError
 
 
 class WorkspacePolicy:

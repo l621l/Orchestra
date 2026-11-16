@@ -2,7 +2,7 @@
 import json
 from collections import defaultdict
 
-from interface_notes import atomic_text
+from orchestra_core.workspace.interface_notes import atomic_text
 
 
 FILENAME = '.orchestra-usage.json'

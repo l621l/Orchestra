@@ -10,10 +10,10 @@ from PySide6.QtWidgets import (
     QInputDialog, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from desktop_options import DEFAULT_CONFIG, LIMITS, MODEL_PRESETS
-from interface_notes import atomic_text
-from model_routing import role_settings, reasoning_levels
-from orchestra_config import (
+from orchestra_core.desktop.desktop_options import DEFAULT_CONFIG, LIMITS, MODEL_PRESETS
+from orchestra_core.workspace.interface_notes import atomic_text
+from orchestra_core.models.model_routing import role_settings, reasoning_levels
+from orchestra_core.runtime.orchestra_config import (
     completion_review_enabled, normalize_settings, project_configuration, project_settings_payload,
     set_completion_review, validate_settings,
 )

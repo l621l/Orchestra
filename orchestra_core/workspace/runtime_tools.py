@@ -90,8 +90,8 @@ def referenced_project_files(repository,argv):
 import os
 import shutil
 import sys
-from tools import definition
-from tool_errors import ToolError
+from orchestra_core.workspace.tools import definition
+from orchestra_core.workspace.tool_errors import ToolError
 
 
 WORKFLOW_TOOLS = [

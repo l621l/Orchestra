@@ -1,7 +1,7 @@
 """Bounded fresh-context review block for development routes."""
 import json
 import re
-from orchestra import parse_task_report
+from orchestra_core.runtime.engine import parse_task_report
 
 REVIEW_PROMPT = '''Independently audit the current implementation against ALL original requirements.
 The implementation report and existing tests are claims to examine, not proof of correctness. Read the current source for each requirement, including unchanged code and real entry points. Diff excerpts are only navigation hints. Inspect the assertions and fixtures of existing tests: identify what would still be broken if those tests passed.

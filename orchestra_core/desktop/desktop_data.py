@@ -5,8 +5,8 @@ import shutil
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from desktop_options import DEFAULT_CONFIG
-from interface_notes import atomic_text
+from orchestra_core.desktop.desktop_options import DEFAULT_CONFIG
+from orchestra_core.workspace.interface_notes import atomic_text
 
 
 class DesktopData:

@@ -3,9 +3,9 @@ import shutil
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock,patch
-from direct_dev import DirectDevelopment
-from orchestra import TurnTrace
-from workspace_status import brief
+from orchestra_core.runtime.direct_dev import DirectDevelopment
+from orchestra_core.runtime.engine import TurnTrace
+from orchestra_core.runtime.workspace_status import brief
 
 class DirectLoop(unittest.IsolatedAsyncioTestCase):
     def call(self, name, **args):
@@ -40,7 +40,7 @@ class DirectLoop(unittest.IsolatedAsyncioTestCase):
         settings=json.loads((base/'settings.json').read_text())
         settings['direct']['completion_review_enabled'] = False
         config={'providers':{'mimo':{},'gpt':{}},'roles':{'writer':{'provider':'mimo','model':'mimo-v2.6-pro'},'strong':{'provider':'gpt','model':'gpt-6.1-sol'}}}
-        with patch('orchestra.BASE',self.root):
+        with patch('orchestra_core.runtime.engine.BASE',self.root):
             self.app=DirectDevelopment(config,self.root,settings,json.loads((base/'prompts.json').read_text()),json.loads((base/'pricing.json').read_text()))
         from unittest.mock import MagicMock
         self.app.dashboard=MagicMock();self.trace=TurnTrace(self.root/'logs','direct',self.root);self.parent=self.trace.start_task('worker','direct')
@@ -142,7 +142,7 @@ class DirectLoop(unittest.IsolatedAsyncioTestCase):
             app.add_usage(entry, {'prompt_tokens': 100, 'completion_tokens': 20, 'total_tokens': 120}, None)
             if role=='strong':return {'role':'assistant','content':'Implement one pending feature using the source already inspected; do not rescan.'}
             return self.call('list_files',path='.')
-        with patch('writer_transport.request',side_effect=respond):
+        with patch('orchestra_core.models.writer_transport.request',side_effect=respond):
             result=await self.app.run_user_task('Build a program',{},self.trace,self.parent)
         self.assertEqual(result['status'],'partial')
         self.assertLessEqual(len(observed),10)

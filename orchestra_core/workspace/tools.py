@@ -9,12 +9,12 @@ import uuid
 from collections import OrderedDict
 from threading import Lock
 from functools import lru_cache
-from tool_errors import ToolError
+from orchestra_core.workspace.tool_errors import ToolError
 from pathlib import Path
 
 import regex as regex_engine
-from workspace_policy import WorkspacePolicy
-from tool_contracts import validate_arguments
+from orchestra_core.workspace.workspace_policy import WorkspacePolicy
+from orchestra_core.workspace.tool_contracts import validate_arguments
 
 
 def definition(name, description, properties, required):

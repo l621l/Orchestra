@@ -1,7 +1,7 @@
 import json
 import unittest
 from unittest.mock import AsyncMock
-from orchestra import OutputLimitError, complete_tool_prefix
+from orchestra_core.runtime.engine import OutputLimitError, complete_tool_prefix
 from tests import test_single_model as fixtures
 
 

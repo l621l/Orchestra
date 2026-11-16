@@ -6,15 +6,15 @@ import stat
 import re
 import signal
 import difflib
-from tool_errors import ToolError
-from project_map import HEADER, ProjectMap
-from interface_notes import FILE as NOTES_FILE, InterfaceNotes, atomic_text
+from orchestra_core.workspace.tool_errors import ToolError
+from orchestra_core.workspace.project_map import HEADER, ProjectMap
+from orchestra_core.workspace.interface_notes import FILE as NOTES_FILE, InterfaceNotes, atomic_text
 import subprocess
 from pathlib import Path, PurePosixPath
 
-from tools import definition
-from workspace_policy import WorkspacePolicy
-from tool_contracts import EDIT_TOOL_NAMES, validate_arguments
+from orchestra_core.workspace.tools import definition
+from orchestra_core.workspace.workspace_policy import WorkspacePolicy
+from orchestra_core.workspace.tool_contracts import EDIT_TOOL_NAMES, validate_arguments
 
 
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_log", "git_show",

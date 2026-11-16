@@ -1,7 +1,7 @@
 """Shared argument validation for the schemas actually exposed to agents."""
 import math
 
-from tool_errors import ToolError
+from orchestra_core.workspace.tool_errors import ToolError
 
 
 EDIT_TOOL_NAMES = frozenset({'create_file', 'replace_text', 'apply_patch'})

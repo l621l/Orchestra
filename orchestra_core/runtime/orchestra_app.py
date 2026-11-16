@@ -2,15 +2,15 @@
 import asyncio
 from pathlib import Path
 
-from task_state import TaskRequest, input_command
-from direct_dev import DirectDevelopment
-from model_errors import error_description
-from orchestra_config import load_configuration
-from project_data import SETTINGS, project_data_path
-from project_usage import record_usage
-from turn_trace import TurnTrace
-from workspace_lease import WorkspaceBusy, workspace_lease
-from workspace_status import workspace_status
+from orchestra_core.runtime.task_state import TaskRequest, input_command
+from orchestra_core.runtime.direct_dev import DirectDevelopment
+from orchestra_core.models.model_errors import error_description
+from orchestra_core.runtime.orchestra_config import load_configuration
+from orchestra_core.workspace.project_data import SETTINGS, project_data_path
+from orchestra_core.workspace.project_usage import record_usage
+from orchestra_core.runtime.turn_trace import TurnTrace
+from orchestra_core.workspace.workspace_lease import WorkspaceBusy, workspace_lease
+from orchestra_core.runtime.workspace_status import workspace_status
 
 
 class OrchestraApp:

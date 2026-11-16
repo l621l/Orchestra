@@ -7,9 +7,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from git_tools import RepositoryTools
-from tools import ProjectTools
-from tool_errors import ToolError, model_result
+from orchestra_core.workspace.git_tools import RepositoryTools
+from orchestra_core.workspace.tools import ProjectTools
+from orchestra_core.workspace.tool_errors import ToolError, model_result
 
 
 class ToolPolish(unittest.TestCase):
@@ -81,7 +81,7 @@ class ToolPolish(unittest.TestCase):
 
     def test_failed_cleanup_does_not_mask_original_replace_failure(self):
         (self.root/'a.txt').write_text('old')
-        with patch('git_tools.os.replace', side_effect=OSError('replace failed')),             patch('git_tools.os.unlink', side_effect=PermissionError('cleanup failed')):
+        with patch('orchestra_core.workspace.git_tools.os.replace', side_effect=OSError('replace failed')),             patch('orchestra_core.workspace.git_tools.os.unlink', side_effect=PermissionError('cleanup failed')):
             with self.assertRaisesRegex(OSError, 'replace failed'):
                 self.repo.replace_text('a.txt','old','new')
         self.assertEqual((self.root/'a.txt').read_text(), 'old')

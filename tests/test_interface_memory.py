@@ -4,12 +4,12 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
-from git_tools import RepositoryTools
-from interface_notes import FILE, InterfaceNotes
-from project_map import ProjectMap, HEADER
-from tool_errors import ToolError
-from tool_contracts import validate_arguments
-from git_tools import GIT_TOOLS
+from orchestra_core.workspace.git_tools import RepositoryTools
+from orchestra_core.workspace.interface_notes import FILE, InterfaceNotes
+from orchestra_core.workspace.project_map import ProjectMap, HEADER
+from orchestra_core.workspace.tool_errors import ToolError
+from orchestra_core.workspace.tool_contracts import validate_arguments
+from orchestra_core.workspace.git_tools import GIT_TOOLS
 
 SOURCE = "from dataclasses import dataclass\n@dataclass\nclass World:\n    mode: str = 'classic'\n\ndef new_game(mode='classic') -> World:\n    return World(mode=mode)\n"
 
@@ -75,7 +75,7 @@ class InterfaceMemory(unittest.TestCase):
         self.assertFalse((self.root/FILE).exists())
 
     def test_notes_storage_failure_does_not_turn_edit_into_failure(self):
-        with patch('interface_notes.atomic_text',side_effect=OSError('disk error')):
+        with patch('orchestra_core.workspace.interface_notes.atomic_text',side_effect=OSError('disk error')):
             result=self.create([self.note])
         self.assertTrue(result['applied'])
         self.assertTrue((self.root/'logic.py').exists())

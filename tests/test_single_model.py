@@ -6,11 +6,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from orchestra import Orchestra, TurnTrace, validate_settings
-from tools import ProjectTools
-from tool_contracts import validate_arguments
-from tool_errors import ToolError
-from git_tools import GIT_TOOLS
+from orchestra_core.runtime.engine import Orchestra, TurnTrace, validate_settings
+from orchestra_core.workspace.tools import ProjectTools
+from orchestra_core.workspace.tool_contracts import validate_arguments
+from orchestra_core.workspace.tool_errors import ToolError
+from orchestra_core.workspace.git_tools import GIT_TOOLS
 
 BASE = Path(__file__).resolve().parents[1]
 
@@ -27,7 +27,7 @@ class SingleModel(unittest.IsolatedAsyncioTestCase):
             "from pathlib import Path; assert Path('value.txt').read_text() == 'correct'"]}
         config = {'providers': {'offline': {}},
                   'roles': {'writer': {'provider': 'offline', 'model': 'mimo-v2.6-pro'}}}
-        with patch('orchestra.BASE', self.root):
+        with patch('orchestra_core.runtime.engine.BASE', self.root):
             self.app = Orchestra(config, self.root, self.settings,
                 json.loads((BASE/'prompts.json').read_text()), {})
         self.app.dashboard = MagicMock()

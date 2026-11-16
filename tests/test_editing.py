@@ -6,8 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from git_tools import RepositoryTools
-from tool_errors import ToolError
+from orchestra_core.workspace.git_tools import RepositoryTools
+from orchestra_core.workspace.tool_errors import ToolError
 
 class ReplacementTests(unittest.TestCase):
     def setUp(self):
@@ -36,7 +36,7 @@ class ReplacementTests(unittest.TestCase):
 
     def test_atomic_replace_failure_leaves_original_and_no_temp(self):
         p=self.root/'a.txt'; p.write_bytes(b'old\n')
-        with patch('git_tools.os.replace',side_effect=OSError('simulated')):
+        with patch('orchestra_core.workspace.git_tools.os.replace',side_effect=OSError('simulated')):
             with self.assertRaises(OSError):
                 self.repo.replace_text('a.txt','old','new')
         self.assertEqual(p.read_bytes(),b'old\n')

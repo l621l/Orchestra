@@ -7,23 +7,23 @@ import math
 import shutil
 import re
 from difflib import SequenceMatcher
-from development_route import RouteContext, run_route, validate_route
+from orchestra_core.runtime.development_route import RouteContext, run_route, validate_route
 from datetime import datetime,timezone
-from model_errors import ModelResponseError, TaskCostLimit, error_description
-from model_routing import clip, role_settings
-from task_state import new_task, read_task
-from interface_notes import atomic_text
-from orchestra import Orchestra, parse_task_report
-from orchestra_tools import tool_handler
-from runtime_tools import run_command, WORKFLOW_TOOLS
-from context_history import fit_event,size
-from tool_errors import ToolError,model_result
-from task_state import input_command
-import responses_transport
-import writer_transport
-from writer_transport import wire_messages
-from stage_budget import allowance, request_budget
-from runtime_checkpoint import save_verified_copy
+from orchestra_core.models.model_errors import ModelResponseError, TaskCostLimit, error_description
+from orchestra_core.models.model_routing import clip, role_settings
+from orchestra_core.runtime.task_state import new_task, read_task
+from orchestra_core.workspace.interface_notes import atomic_text
+from orchestra_core.runtime.engine import Orchestra, parse_task_report
+from orchestra_core.workspace.orchestra_tools import tool_handler
+from orchestra_core.workspace.runtime_tools import run_command, WORKFLOW_TOOLS
+from orchestra_core.runtime.context_history import fit_event,size
+from orchestra_core.workspace.tool_errors import ToolError,model_result
+from orchestra_core.runtime.task_state import input_command
+from orchestra_core.models import responses_transport
+from orchestra_core.models import writer_transport
+from orchestra_core.models.writer_transport import wire_messages
+from orchestra_core.runtime.stage_budget import allowance, request_budget
+from orchestra_core.workspace.runtime_checkpoint import save_verified_copy
 
 EDIT_NEXT = ('When the user requests a change and you have enough source evidence for one correct edit, '
              'your next response must call replace_text for an existing file or create_file for a new file. '
@@ -176,7 +176,7 @@ class DirectDevelopment(Orchestra):
         return self.project_data / 'ORCHESTRA_JOURNAL.jsonl'
 
     def legacy_journal_path(self):
-        from project_data import generated
+        from orchestra_core.workspace.project_data import generated
         workspace_copy = self.files.root / self.journal_path.name
         if (workspace_copy.is_file() and not workspace_copy.is_symlink()
                 and generated(workspace_copy.name, workspace_copy.read_text(encoding='utf-8'))):

@@ -1,8 +1,8 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from stage_budget import allowance, request_budget
-from model_errors import TaskCostLimit
+from orchestra_core.runtime.stage_budget import allowance, request_budget
+from orchestra_core.models.model_errors import TaskCostLimit
 from tests import test_direct_core as fixtures
 
 
@@ -45,7 +45,7 @@ class StageBudgetIntegration(unittest.IsolatedAsyncioTestCase):
             engine.begin_usage(args[3], role, role, 'mimo', 'mimo-v2.6-pro')
             return {'role': 'assistant', 'content': 'response'}
 
-        with patch('writer_transport.request', side_effect=unmetered) as transport:
+        with patch('orchestra_core.models.writer_transport.request', side_effect=unmetered) as transport:
             await app.request_executor('writer', 'continuous_work', [], [], '', {},
                                        self.trace, self.parent, False, max_output_tokens=8192)
             self.assertTrue(app._state['budget_estimated'])
@@ -70,7 +70,7 @@ class StageBudgetIntegration(unittest.IsolatedAsyncioTestCase):
             engine.add_usage(entry, {'prompt_tokens': 100, 'completion_tokens': 100, 'total_tokens': 200}, None)
             return {'role': 'assistant', 'content': 'done'}
 
-        with patch('writer_transport.request', side_effect=reply):
+        with patch('orchestra_core.models.writer_transport.request', side_effect=reply):
             await app.request_executor('writer', 'completion_review', [], [], '', usage,
                                        self.trace, self.parent, False, max_output_tokens=8192)
         self.assertEqual(app._state['stage_spent']['implement'], .79)
@@ -83,7 +83,7 @@ class StageBudgetIntegration(unittest.IsolatedAsyncioTestCase):
         app.options.update(max_task_cost_usd=1, completion_review_enabled=True)
         app.load_or_start('Build code')
         app._state.update(budget_spent=.95, stage_spent={'implement': .95, 'review': 0})
-        with patch('writer_transport.request', new_callable=AsyncMock) as transport:
+        with patch('orchestra_core.models.writer_transport.request', new_callable=AsyncMock) as transport:
             await app.request_executor('writer', 'continuous_work', [], [], '', {},
                                        self.trace, self.parent, False, max_output_tokens=8192)
             transport.assert_awaited_once()

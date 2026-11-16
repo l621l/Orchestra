@@ -2,7 +2,7 @@
 import traceback
 from pathlib import Path
 
-from tool_errors import ToolError
+from orchestra_core.workspace.tool_errors import ToolError
 
 
 class ModelResponseError(RuntimeError):
