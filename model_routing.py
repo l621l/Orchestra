@@ -52,4 +52,7 @@ def role_settings(config, role):
     effort = writer.get('reasoning_effort', 'default')
     if effort != 'default' and effort not in reasoning_levels(provider_name, model):
         raise ValueError(f'Unsupported reasoning effort for {provider_name} / {model}: {effort}')
-    return {'thinking_parameter': provider_name == 'mimo', **writer, 'transport': transport}
+    display = {}
+    if key == 'reviewer' and 'stream_reasoning' in roles.get('writer', {}):
+        display['stream_reasoning'] = roles['writer']['stream_reasoning']
+    return {'thinking_parameter': provider_name == 'mimo', **display, **writer, 'transport': transport}

@@ -13,7 +13,10 @@ from PySide6.QtWidgets import (
 from desktop_options import DEFAULT_CONFIG, LIMITS, MODEL_PRESETS
 from interface_notes import atomic_text
 from model_routing import role_settings, reasoning_levels
-from orchestra_config import completion_review_enabled, normalize_settings, set_completion_review, validate_settings
+from orchestra_config import (
+    completion_review_enabled, normalize_settings, project_configuration, project_settings_payload,
+    set_completion_review, validate_settings,
+)
 
 
 REVIEW_LIMITS = (
@@ -25,13 +28,26 @@ REVIEW_LIMITS = (
 class SettingsComboBox(QComboBox):
     def __init__(self):
         super().__init__()
+        self.popup_pressed = False
         self.view().viewport().installEventFilter(self)
         self.activated.connect(self.hidePopup)
 
+    def showPopup(self):
+        self.popup_pressed = False
+        super().showPopup()
+
     def eventFilter(self, watched, event):
-        if (event.type() == QEvent.Type.MouseButtonRelease
-                and watched is self.view().viewport()
-                and event.button() == Qt.MouseButton.LeftButton):
+        if (watched is not self.view().viewport()
+                or event.type() not in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease)
+                or event.button() != Qt.MouseButton.LeftButton):
+            return super().eventFilter(watched, event)
+        if event.type() == QEvent.Type.MouseButtonPress:
+            self.popup_pressed = True
+        else:
+            # Windows can deliver the release that opened the popup to its viewport.
+            if not self.popup_pressed:
+                return True
+            self.popup_pressed = False
             index = self.view().indexAt(event.position().toPoint())
             selectable = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
             if index.isValid() and index.flags() & selectable == selectable:
@@ -44,15 +60,18 @@ class SettingsComboBox(QComboBox):
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent, data):
+    def __init__(self, parent, data, *, project_path=None, global_only=False):
         super().__init__(parent)
         self.data = data
-        self.setWindowTitle('Orchestra Settings')
+        self.project_path = project_path
+        self.global_only = global_only
+        self.setWindowTitle('Project Settings' if project_path else 'Orchestra Settings')
         self.resize(570, 440)
         self.settings_path = data.root / 'settings.json'
         self.settings = normalize_settings(json.loads(self.settings_path.read_text(encoding='utf-8')))
         self.config = (json.loads(data.config.read_text(encoding='utf-8'))
                        if data.config.exists() else copy.deepcopy(DEFAULT_CONFIG))
+        self.config, self.settings = project_configuration(project_path, self.config, self.settings)
         for name, provider in DEFAULT_CONFIG['providers'].items():
             self.config['providers'].setdefault(name, copy.deepcopy(provider))
         self.pricing_path = data.root / 'pricing.json'
@@ -75,7 +94,8 @@ class SettingsDialog(QDialog):
         for section, key, label, _, _, default in LIMITS:
             field = QLineEdit(str(self.settings.get(section, {}).get(key, default)))
             self.limits[section, key] = field
-            limits.addRow(label, field)
+            if section != 'api':
+                limits.addRow(label, field)
 
         direct = self.settings['direct']
         self.review_enabled = QCheckBox('Run a completion review')
@@ -109,7 +129,7 @@ class SettingsDialog(QDialog):
         self.review_enabled.toggled.connect(review_panel.setVisible)
 
         writer = role_settings(self.config, 'writer')
-        models = self.form(tabs, 'Models')
+        models = self.form(tabs, 'Model Catalog' if global_only else 'Models')
         self.writer_provider = self.combo(self.config['providers'], writer['provider'])
         self.model = self.combo([])
         self.update_models(self.writer_provider.currentText())
@@ -119,9 +139,11 @@ class SettingsDialog(QDialog):
         self.thinking = QCheckBox('Enable model reasoning (Chat Completions)')
         self.thinking.setChecked(writer.get('thinking', 'enabled') == 'enabled')
         self.stream = QCheckBox('Show model reasoning as it streams')
+        self.stream.setToolTip('Applies to the executor and the Debug reviewer.')
         self.stream.setChecked(writer.get('stream_reasoning', writer['model'].lower() == 'gpt-6.1-sol') is True)
-        models.addRow(self.action('Add Model', self.add_model))
-        models.addRow('Executor provider', self.writer_provider)
+        add_model = self.action('Add Model', self.add_model)
+        models.addRow(add_model)
+        models.addRow('Provider' if global_only else 'Executor provider', self.writer_provider)
         models.addRow('Model', self.model)
         self.writer_effort = self.combo([])
         models.addRow('Executor reasoning effort', self.writer_effort)
@@ -174,6 +196,7 @@ class SettingsDialog(QDialog):
         providers.addRow('Provider', self.provider)
         providers.addRow('API URL', self.address)
         providers.addRow('API key', self.key)
+        providers.addRow('API timeout (seconds)', self.limits['api', 'timeout_seconds'])
 
         providers.addRow(self.action('Add Provider', self.add_provider))
 
@@ -192,11 +215,25 @@ class SettingsDialog(QDialog):
         push = self.git_flags['allow_git_push']
         push.setToolTip('Requires repository tools and local commits to be enabled.')
         def update_push_enabled():
-            push.setEnabled(self.git_flags['git_tools_enabled'].isChecked()
-                            and self.git_flags['allow_git_mutations'].isChecked())
+            enabled = (self.git_flags['git_tools_enabled'].isChecked()
+                       and self.git_flags['allow_git_mutations'].isChecked())
+            if not enabled:
+                push.setChecked(False)
+            push.setEnabled(enabled)
         self.git_flags['git_tools_enabled'].toggled.connect(update_push_enabled)
         self.git_flags['allow_git_mutations'].toggled.connect(update_push_enabled)
         update_push_enabled()
+
+        if project_path is not None:
+            tabs.setTabVisible(tabs.indexOf(providers.parentWidget()), False)
+            models.setRowVisible(add_model, False)
+            models.setRowVisible(self.pricing_group, False)
+        elif global_only:
+            for section in (limits, git):
+                tabs.setTabVisible(tabs.indexOf(section.parentWidget()), False)
+            for field in (self.writer_effort, self.thinking, self.stream):
+                models.setRowVisible(field, False)
+            tabs.setCurrentWidget(providers.parentWidget())
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.button(QDialogButtonBox.StandardButton.Save).setText('Save')
@@ -406,6 +443,8 @@ class SettingsDialog(QDialog):
         try:
             fields = (*LIMITS, *REVIEW_LIMITS) if self.review_enabled.isChecked() else LIMITS
             for section, key, label, parse, minimum, _ in fields:
+                if self.global_only and section != 'api' or self.project_path is not None and section == 'api':
+                    continue
                 raw = self.limits[section, key].text().strip()
                 try:
                     value = parse(raw.replace(',', '.') if parse is float else raw)
@@ -414,6 +453,19 @@ class SettingsDialog(QDialog):
                 if not math.isfinite(value) or value < minimum or (minimum == 0 and value == 0):
                     raise ValueError(label + ' — value out of range.')
                 settings.setdefault(section, {})[key] = value
+            if self.global_only:
+                validate_settings(settings)
+                self.store_provider()
+                for name, provider in self.config['providers'].items():
+                    address = provider.get('base_url')
+                    if (address or name not in DEFAULT_CONFIG['providers']) and not self.valid_address(address):
+                        raise ValueError('Check the API URL for ' + name + '.')
+                self.remember_rates()
+                if self.rate_drafts:
+                    self.collect_rates(self.writer_provider.currentText(), self.model.currentText())
+                self.save_shared(settings)
+                self.accept()
+                return
             direct = settings['direct']
             enabled = self.review_enabled.isChecked()
             set_completion_review(direct, enabled)
@@ -422,7 +474,8 @@ class SettingsDialog(QDialog):
             if not 0 < direct.get('completion_review_budget_percent', 20) < 100:
                 raise ValueError('Review budget percentage must be between 0 and 100.')
             validate_settings(settings)
-            self.store_provider()
+            if self.project_path is None:
+                self.store_provider()
             provider = self.writer_provider.currentText()
             model = self.model.currentText().strip()
             if not model:
@@ -438,24 +491,35 @@ class SettingsDialog(QDialog):
                           stream_reasoning=self.stream.isChecked())
             self.config['roles']['writer'] = writer
             role_settings(self.config, 'writer')
-            self.collect_rates(provider, model)
+            if self.project_path is None:
+                self.collect_rates(provider, model)
+            elif model not in self.catalog.get(provider, {}):
+                raise ValueError(f'Add prices for {provider} / {model} in Global Settings.')
             if self.review_provider.currentIndex() > 0:
                 reviewer_provider = self.review_provider.currentText()
                 reviewer_model = self.review_model.currentText()
                 if not reviewer_model:
                     raise ValueError('Choose a model for completion review.')
                 if enabled and reviewer_model not in self.catalog.get(reviewer_provider, {}):
-                    raise ValueError(f'Enter prices for {reviewer_provider} / {reviewer_model} in Models.')
+                    raise ValueError(f'Add prices for {reviewer_provider} / {reviewer_model} in the model catalog.')
                 self.config['roles']['reviewer'] = {'provider': reviewer_provider, 'model': reviewer_model,
                                                    'reasoning_effort': self.review_effort.currentText()}
                 role_settings(self.config, 'reviewer')
             else:
                 self.config['roles'].pop('reviewer', None)
-            if self.pricing_changed:
-                atomic_text(self.pricing_path, json.dumps(self.pricing, ensure_ascii=False, indent=2))
-            atomic_text(self.data.config, json.dumps(self.config, ensure_ascii=False, indent=2))
-            atomic_text(self.settings_path, json.dumps(settings, ensure_ascii=False, indent=2))
+            if self.project_path is None:
+                self.save_shared(settings)
+            else:
+                self.project_path.parent.mkdir(parents=True, exist_ok=True)
+                payload = project_settings_payload(self.config, settings)
+                atomic_text(self.project_path, json.dumps(payload, ensure_ascii=False, indent=2))
         except (OSError, ValueError, OverflowError) as error:
             QMessageBox.warning(self, 'Orchestra Settings', str(error))
             return
         self.accept()
+
+    def save_shared(self, settings):
+        if self.pricing_changed:
+            atomic_text(self.pricing_path, json.dumps(self.pricing, ensure_ascii=False, indent=2))
+        atomic_text(self.data.config, json.dumps(self.config, ensure_ascii=False, indent=2))
+        atomic_text(self.settings_path, json.dumps(settings, ensure_ascii=False, indent=2))

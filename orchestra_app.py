@@ -6,6 +6,7 @@ from task_state import TaskRequest, input_command
 from direct_dev import DirectDevelopment
 from model_errors import error_description
 from orchestra_config import load_configuration
+from project_data import SETTINGS, project_data_path
 from project_usage import record_usage
 from turn_trace import TurnTrace
 from workspace_lease import WorkspaceBusy, workspace_lease
@@ -22,10 +23,12 @@ class OrchestraApp:
     @classmethod
     def from_directory(cls, directory, workspace, *, dashboard=None, logs_path=None):
         directory = Path(directory)
-        config, settings, prompts, pricing = load_configuration(directory)
+        logs = directory / 'logs' if logs_path is None else logs_path
+        config, settings, prompts, pricing = load_configuration(
+            directory, project_data_path(logs, workspace) / SETTINGS)
         engine = DirectDevelopment(config, workspace, settings, prompts, pricing,
                                    dashboard=dashboard,
-                                   logs_path=directory / 'logs' if logs_path is None else logs_path)
+                                   logs_path=logs)
         return cls(engine)
 
     def status(self):

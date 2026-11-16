@@ -39,9 +39,9 @@ existing tests and execute an independent targeted check. Reported command argum
 are matched to successful tool results after the latest edit; missing coverage or
 baseline-only reports cannot pass. This checks evidence structure, not the semantic
 quality of the model's tests. Review can commit and push verified fixes when those
-options are enabled under Settings > Git.
+options are enabled under Project Settings > Git.
 Implementation can use the full task allowance. Review uses the remaining funds
-up to 20% of `max_task_cost_usd` by default. Change the percentage under Settings > Limits.
+up to 20% of `max_task_cost_usd` by default. Change it under Project Settings > Limits.
 Old review call limits are removed when loading configuration; global call/step
 limits remain as loop protection. The output ceiling per review request is 8192,
 further reduced using remaining funds and an input-cost estimate with a margin.
@@ -57,7 +57,7 @@ Budget exhaustion leaves the task partial. Reports and stage statuses are
 saved in task state, trace and the local project journal; no `VALIDATION.md` is
 automatically created. A resumed partial task starts the route again against the
 current files. Review uses fresh messages and defaults to the executor's model.
-Choose a separate provider and model under Settings → Limits, or set
+Choose a separate provider and model under Project Settings > Limits, or set
 `roles.reviewer` in the connection configuration. The selected reviewer needs
 its own pricing entry. Its charges count toward the shared task budget.
 
@@ -71,36 +71,26 @@ Orchestra commits a repository copy of `PROJECT_MAP.md` generated from the
 staged Python sources. It refreshes that copy only when creating a commit and
 preserves a user-authored map.
 
-Reasoning effort is selected separately under Settings > Models (executor) and
-Settings > Limits (reviewer). `Same as executor` inherits the executor's effort.
+Reasoning effort is selected separately under Project Settings > Models for the executor
+and Project Settings > Limits for the reviewer. `Same as executor` inherits the executor's effort.
 The role configuration stores `reasoning_effort`; `default` omits the API effort
 parameter rather than forcing `low`. Known GPT models expose their supported
 levels; unknown models and providers without supported effort controls disable
 the selector and omit the parameter. MiMo retains its existing thinking toggle.
 Capability reference: https://developers.openai.com/api/docs/guides/deployment-checklist
 
-Выбранная модель читает проект, меняет файлы, запускает проверки и продолжает
-задачу в одном диалоге. Плановый пайплайн, эксперт, отдельный режим отладки и финальный ревьюер удалены.
-Для исправления ошибки достаточно обычной задачи в Direct.
+Исполнитель читает проект, меняет файлы и запускает проверки. В приложении
+можно запускать задачи в разных проектах одновременно. У каждого проекта
+свои настройки, журнал и кнопка остановки.
 
 ## Запуск
 
-Установите Python и зависимости из `requirements.txt`. Для новой установки
-скопируйте `config.example.json` в `config.local.json` и укажите ключ выбранного провайдера.
-Существующий локальный ключ сохранён; файл с ключом исключён из Git.
+Для запуска приложения на Windows установите Python и Git. Из папки Orchestra
+выполните:
 
 ```cmd
-py -m pip install -r requirements.txt
-py -B orchestra.py --workspace "C:\path\to\project"
-```
-
-GUI:
-
-Окно на PySide6 можно запустить отдельно. Оно использует те же настройки и историю проектов.
-
-```sh
-python -m pip install -r requirements-qt.txt
-python -B orchestra_qt.py
+py -m pip install -r requirements-qt.txt
+py -B orchestra_qt.py
 ```
 
 On Ubuntu or Debian (including WSL), run `bash start-linux.sh` from the repository.
@@ -109,11 +99,23 @@ environment, and opens the desktop app. APT may ask for your sudo password.
 For commits, configure `git config user.name` and `git config user.email` in
 your project. Pushing to GitHub also requires credentials in the Linux environment.
 
-GUI хранит настройки в `%LOCALAPPDATA%\Orchestra`. Через настройки можно задать
-модель, ключ, лимиты и доступ к Git. Старые настройки `pipeline`
-читаются как настройки Direct; параметры удалённых режимов игнорируются.
-Для GPT в CLI укажите в roles.writer провайдер gpt, модель gpt-6.1-sol. Orchestra выбирает API по модели автоматически.
-CLI может использовать тот же каталог через `--data-dir`.
+GUI хранит настройки в `%LOCALAPPDATA%\Orchestra`. В **Global Settings** задаются
+подключения провайдеров, тайм-аут API и цены моделей. В **Project Settings** выбранного
+проекта задаются исполнитель, ревьюер, лимиты, Debug и доступ к Git. Проектные
+настройки сохраняются локально по пути проекта и действуют при следующем запуске.
+Пока у проекта нет своих настроек, он использует прежние общие значения.
+В Linux каталог по умолчанию — `~/.local/share/Orchestra`.
+
+Для запуска из терминала установите зависимости из `requirements.txt`,
+скопируйте `config.example.json` в `config.local.json` и укажите ключ провайдера.
+Файл с ключом исключён из Git.
+
+```cmd
+py -m pip install -r requirements.txt
+py -B orchestra.py --workspace "C:\path\to\project"
+```
+
+CLI может использовать настройки и историю приложения через `--data-dir`.
 
 ## Работа
 

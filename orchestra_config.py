@@ -19,13 +19,39 @@ def set_completion_review(direct, enabled):
             route.remove('review')
 
 
-def load_configuration(directory):
+PROJECT_SECTIONS = ('direct', 'execution', 'generation', 'tools', 'checks')
+
+
+def project_configuration(path, config, settings):
+    if path is None:
+        return config, settings
+    try:
+        project = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return config, settings
+    if not isinstance(project, dict) or not isinstance(project.get('settings', {}), dict):
+        raise ValueError('Invalid project settings file.')
+    roles = project.get('roles', config.get('roles', {}))
+    if not isinstance(roles, dict):
+        raise ValueError('Invalid project model settings.')
+    overrides = project.get('settings', {})
+    settings = {**settings, **{key: overrides[key] for key in PROJECT_SECTIONS if key in overrides}}
+    return {**config, 'roles': roles}, settings
+
+
+def project_settings_payload(config, settings):
+    return {'roles': config['roles'],
+            'settings': {key: settings[key] for key in PROJECT_SECTIONS if key in settings}}
+
+
+def load_configuration(directory, project_settings=None):
     directory = Path(directory)
     config, settings, prompts, pricing = tuple(
         json.loads((directory / name).read_text(encoding='utf-8'))
         for name in ('config.local.json', 'settings.json', 'prompts.json', 'pricing.json')
     )
-    return config, normalize_settings(settings), prompts, pricing
+    config, settings = project_configuration(project_settings, config, normalize_settings(settings))
+    return config, settings, prompts, pricing
 
 
 def normalize_settings(settings):

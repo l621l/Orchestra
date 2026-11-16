@@ -15,6 +15,28 @@ class MiMoContext(unittest.IsolatedAsyncioTestCase):
             choices=[SimpleNamespace(finish_reason='tool_calls',message=Item(role='assistant',content=None,
                 reasoning_content=reasoning,tool_calls=[{'id':'read1','type':'function','function':{'name':'read_file','arguments':'{"path":"main.py"}'}}]))])
 
+    async def test_debug_reviewer_streams_reasoning_with_shared_display_setting(self):
+        config = self.app.config['roles']
+        config['writer']['stream_reasoning'] = True
+        config['reviewer'] = {'provider': 'mimo', 'model': 'mimo-v2.6-pro'}
+        progress = []
+        self.trace.on_progress = progress.append
+        response = self.response()
+        delta = SimpleNamespace(content='Review result', reasoning_content='Review thought', tool_calls=[])
+        stream = AsyncMock()
+        stream.__aiter__.return_value = [SimpleNamespace(
+            id=response.id, model=response.model, usage=response.usage,
+            choices=[SimpleNamespace(index=0, finish_reason='stop', delta=delta)])]
+        create = AsyncMock(return_value=stream)
+        self.app.clients['mimo'] = SimpleNamespace(chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create)))
+        result = await request(self.app, 'reviewer', [{'role': 'user', 'content': 'Check code'}],
+                               [], 'budget', {}, self.trace, self.parent)
+        self.assertTrue(create.call_args.kwargs['stream'])
+        self.assertEqual(result['reasoning_content'], 'Review thought')
+        self.assertEqual([event['text'] for event in progress if event['kind'] == 'reasoning'],
+                         ['Review thought'])
+
     async def test_thinking_stays_enabled_on_second_working_call_and_reasoning_round_trips(self):
         self.app.load_or_start('Develop program')
         thought='long reasoning '*400

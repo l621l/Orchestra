@@ -20,6 +20,36 @@ from desktop_data import DesktopData
 
 @unittest.skipIf(QApplication is None, 'Install requirements-qt.txt for Qt tests')
 class QtDesktopTests(unittest.TestCase):
+    def test_opening_click_release_does_not_select_a_combo_item(self):
+        from PySide6.QtCore import QEvent, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+        from qt_settings import SettingsComboBox
+
+        combo = SettingsComboBox()
+        combo.addItems(['First', 'Second'])
+        combo.show()
+        try:
+            combo.showPopup()
+            self.qt.processEvents()
+            view = combo.view()
+            position = QPointF(view.visualRect(combo.model().index(1, 0)).center())
+            button = Qt.MouseButton.LeftButton
+
+            def send(event_type, buttons):
+                event = QMouseEvent(event_type, position, view.viewport().mapToGlobal(position),
+                                    button, buttons, Qt.KeyboardModifier.NoModifier)
+                self.qt.sendEvent(view.viewport(), event)
+
+            send(QEvent.Type.MouseButtonRelease, Qt.MouseButton.NoButton)
+            self.assertTrue(view.isVisible())
+            self.assertEqual(combo.currentIndex(), 0)
+            send(QEvent.Type.MouseButtonPress, button)
+            send(QEvent.Type.MouseButtonRelease, Qt.MouseButton.NoButton)
+            self.assertEqual(combo.currentIndex(), 1)
+            self.assertFalse(view.isVisible())
+        finally:
+            combo.close()
+
     def test_reasoning_roundtrip_and_model_switch(self):
         import json
         with tempfile.TemporaryDirectory() as temporary:
@@ -54,6 +84,52 @@ class QtDesktopTests(unittest.TestCase):
                 self.assertFalse(reopened.review_effort.isEnabled())
             finally:
                 reopened.close()
+
+    def test_project_settings_isolate_models_limits_debug_and_git(self):
+        import json
+        from orchestra_app import OrchestraApp
+        from project_data import SETTINGS, project_data_path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = DesktopData(Path(__file__).resolve().parents[1], root / 'data')
+            data.initialize()
+            first = root / 'first'
+            second = root / 'second'
+            first.mkdir()
+            second.mkdir()
+            global_dialog = SettingsDialog(None, data, global_only=True)
+            global_dialog.limits['api', 'timeout_seconds'].setText('123')
+            global_dialog.save()
+            self.assertTrue(data.config.is_file())
+            path = project_data_path(data.logs, first) / SETTINGS
+            dialog = SettingsDialog(None, data, project_path=path)
+            dialog.writer_provider.setCurrentText('gpt')
+            dialog.model.setCurrentText('gpt-6.1-sol')
+            dialog.limits['direct', 'max_task_cost_usd'].setText('0.42')
+            dialog.review_enabled.setChecked(False)
+            flags = dialog.git_flags
+            flags['git_tools_enabled'].setChecked(True)
+            flags['allow_git_mutations'].setChecked(True)
+            flags['allow_git_push'].setChecked(True)
+            flags['allow_git_mutations'].setChecked(False)
+            self.assertFalse(flags['allow_git_push'].isEnabled())
+            self.assertFalse(flags['allow_git_push'].isChecked())
+            dialog.save()
+            self.assertTrue(path.is_file())
+            local = json.loads(path.read_text(encoding='utf-8'))
+            self.assertNotIn('providers', local)
+            self.assertNotIn('api', local['settings'])
+            self.assertFalse(local['settings']['tools']['allow_git_push'])
+            a = OrchestraApp.from_directory(data.root, first, logs_path=data.logs).engine
+            b = OrchestraApp.from_directory(data.root, second, logs_path=data.logs).engine
+            self.assertEqual(a.role_settings('writer')['model'], 'gpt-6.1-sol')
+            self.assertEqual(b.role_settings('writer')['provider'], 'mimo')
+            self.assertEqual(a.options['max_task_cost_usd'], 0.42)
+            self.assertNotEqual(a.options['max_task_cost_usd'], b.options['max_task_cost_usd'])
+            self.assertEqual(a.settings['api']['timeout_seconds'], 123)
+            self.assertEqual(b.settings['api']['timeout_seconds'], 123)
+            self.assertFalse(a.options['completion_review_enabled'])
 
     @classmethod
     def setUpClass(cls):
@@ -284,12 +360,40 @@ class QtDesktopTests(unittest.TestCase):
                 self.assertTrue(window.projects.isEnabled())
                 self.assertTrue(all(button.isEnabled() for button in window.project_actions))
                 self.assertEqual(window.workspace, other)
+                self.assertTrue(window.start_button.isEnabled())
+                self.assertFalse(window.stop_button.isEnabled())
+                second_client = SimpleNamespace(close=AsyncMock())
+
+                async def other_work(_text, on_progress):
+                    on_progress(dict(kind='reasoning', request_id='req', model='Sol', text='Other project'))
+                    await asyncio.Event().wait()
+
+                second_session = SimpleNamespace(
+                    new_task=other_work, engine=SimpleNamespace(clients={'gpt': second_client}, settings={}))
+                window.prompt.setPlainText('Check other project')
+                with patch.object(window, 'session', return_value=second_session) as create_session:
+                    window.start('new_task')
+                    window.start('new_task')
+                    create_session.assert_called_once()
+                window.tick()
+                first_task = window.runs[original].task
+                self.assertFalse(first_task.done())
+                self.assertIn('Other project', window.reasoning.toPlainText())
                 window.progress(dict(kind='reasoning', request_id='background', model='Sol',
-                                     text='Background reasoning'))
+                                     text='Background reasoning'), original)
                 self.assertNotIn('Background reasoning', window.reasoning.toPlainText())
+                window.stop()
+                for _ in range(5):
+                    window.tick()
+                    if window.task is None:
+                        break
+                self.assertIsNone(window.task)
+                self.assertFalse(first_task.done())
+                second_client.close.assert_awaited_once()
                 window.register_project(original)
                 self.assertIn('Start\nLine\tTab', window.reasoning.toPlainText())
                 self.assertIn('Background reasoning', window.reasoning.toPlainText())
+                self.assertNotIn('Other project', window.reasoning.toPlainText())
                 self.assertIsNotNone(window.task)
                 self.assertIn('Сводка', window.reasoning.toPlainText())
                 self.assertIn('черновик', window.reasoning.toPlainText())

@@ -9,6 +9,7 @@ from project_map import HEADER
 
 JOURNAL = 'ORCHESTRA_JOURNAL.jsonl'
 MAP = 'PROJECT_MAP.md'
+SETTINGS = 'project-settings.json'
 
 
 def project_data_path(logs, workspace):

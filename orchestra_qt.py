@@ -7,6 +7,7 @@ import shutil
 import sys
 import subprocess
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -26,10 +27,10 @@ from PySide6.QtWidgets import (
 from desktop_data import DesktopData
 from interface_notes import atomic_text
 from orchestra_app import OrchestraApp
-from orchestra_config import completion_review_enabled, set_completion_review
+from orchestra_config import completion_review_enabled, normalize_settings, project_configuration, set_completion_review
 from tool_errors import ToolError
 from project_usage import IGNORE_RULE, read_usage
-from project_data import preserve_legacy_checkout_changes, project_data_path
+from project_data import SETTINGS, preserve_legacy_checkout_changes, project_data_path
 from qt_git_graph import GitGraph
 from qt_settings import SettingsDialog
 from qt_statistics import UsageDialog
@@ -144,15 +145,24 @@ def run_timestamp(directory, summary):
     return stamp.astimezone()
 
 
+@dataclass
+class ProjectRun:
+    started_at: float = field(default_factory=time.monotonic)
+    activity: str = 'Starting'
+    task: asyncio.Task | None = None
+    view: tuple[str, str] = ('', '')
+    pending: list = field(default_factory=list)
+    stream_item: tuple | None = None
+    reasoning_escape: str = ''
+    status: str = ''
+
+
 class DesktopWindow(QMainWindow):
     def __init__(self, data, loop, workspace=None):
         super().__init__()
         self.data = data
         self.loop = loop
-        self.task = None
-        self.run_workspace = None
-        self.run_view = None
-        self.pending_run_output = []
+        self.runs = {}
         self.closing = False
         self.preferences = data.load_preferences()
         saved_view = self.preferences.get('window_view', {})
@@ -162,8 +172,6 @@ class DesktopWindow(QMainWindow):
             workspace = saved_view['workspace']
         self.workspace = Path(workspace).resolve() if workspace else None
         self.selected_run = None
-        self.stream_item = None
-        self.reasoning_escape = ''
         self.setWindowTitle('Orchestra')
         self.resize(1120, 720)
         split = self.main_split = QSplitter()
@@ -182,6 +190,7 @@ class DesktopWindow(QMainWindow):
         brand.addWidget(emblem)
         brand.addWidget(QLabel('Orchestra'))
         brand.addStretch()
+        self.button(brand, 'Global Settings', self.open_global_settings)
         sidebar.addLayout(brand)
         sidebar.addWidget(QLabel('Projects'))
         self.project_actions = []
@@ -244,14 +253,12 @@ class DesktopWindow(QMainWindow):
         actions.addStretch()
         self.review_button = self.button(actions, 'Debug Only', lambda: self.start('review_task'))
         self.review_button.setToolTip('Audit the current project using the prompt and what_to_do.md.')
-        self.button(actions, 'Settings', self.open_settings)
-        self.sync_debug_checkbox()
+        self.project_settings_button = self.button(actions, 'Project Settings', self.open_settings)
         self.with_debug.toggled.connect(self.save_debug_checkbox)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.hide()
         editor_layout.addWidget(self.progress_bar)
-        self.activity = ''
         self.activity_label = QLabel()
         editor_layout.addWidget(self.activity_label)
         tabs = self.tabs = QTabWidget()
@@ -356,10 +363,14 @@ class DesktopWindow(QMainWindow):
         self.projects.blockSignals(True)
         self.projects.clear()
         active = None
+        selected_history = None
         for path in paths:
             if path in hidden or not Path(path).is_dir():
                 continue
             item = QTreeWidgetItem(self.projects, ['', Path(path).name or path])
+            if run := self.runs.get(Path(path).resolve()):
+                if run.task is not None:
+                    item.setText(0, '●')
             item.setToolTip(1, path)
             item.setData(0, Qt.ItemDataRole.UserRole, (path, None))
             days = {}
@@ -377,13 +388,15 @@ class DesktopWindow(QMainWindow):
                 run = QTreeWidgetItem(days[date], [stamp.strftime('%H:%M') if stamp else '', topic])
                 run.setToolTip(1, topic)
                 run.setData(0, Qt.ItemDataRole.UserRole, (path, (directory, summary)))
+                if path == str(self.workspace) and self.selected_run and directory == self.selected_run[0]:
+                    selected_history = run
             item.setExpanded(path in expanded)
             if path == str(self.workspace):
                 active = item
         active = active or self.projects.topLevelItem(0)
         workspace = None
         if active:
-            self.projects.setCurrentItem(active)
+            self.projects.setCurrentItem(selected_history or active)
             workspace = Path(active.data(0, Qt.ItemDataRole.UserRole)[0])
         if workspace != self.workspace:
             self.store_run_view()
@@ -423,8 +436,10 @@ class DesktopWindow(QMainWindow):
             return
         menu = QMenu(self)
         hide = menu.addAction('Hide Project')
+        path, _ = item.data(0, Qt.ItemDataRole.UserRole)
+        run = self.runs.get(Path(path).resolve())
+        hide.setEnabled(run is None or run.task is None)
         if menu.exec(self.projects.viewport().mapToGlobal(position)) == hide:
-            path, _ = item.data(0, Qt.ItemDataRole.UserRole)
             hidden = self.preferences.setdefault('hidden_workspaces', [])
             if path not in hidden:
                 hidden.append(path)
@@ -566,12 +581,16 @@ class DesktopWindow(QMainWindow):
         self.path.setText(str(self.workspace or ''))
         self.refresh_files()
         self.refresh_project_cost()
-        self.continue_button.setEnabled(self.task is None and self.selected_run is None)
+        self.refresh_run_controls()
+        self.sync_debug_checkbox()
+        if self.task and not self.selected_run:
+            self.status.setText(self.current_run.status or 'Task running')
+            return
         if self.selected_run:
             self.status.setText('Viewing a past run. Select the project to continue.')
             return
         if not self.data.config.is_file():
-            self.status.setText('Open Settings and configure a provider.')
+            self.status.setText('Open Global Settings and configure a provider.')
             return
         try:
             state = self.session().status()
@@ -617,37 +636,53 @@ class DesktopWindow(QMainWindow):
         dialog.exec()
         dialog.deleteLater()
 
+    def project_settings_path(self):
+        return project_data_path(self.data.logs, self.workspace) / SETTINGS if self.workspace else None
+
     def sync_debug_checkbox(self):
-        path = self.data.root / 'settings.json'
+        path = self.project_settings_path()
         try:
-            settings = json.loads(path.read_text(encoding='utf-8'))
-            enabled = completion_review_enabled(settings.get('direct', settings.get('pipeline', {})))
+            defaults = normalize_settings(json.loads((self.data.root / 'settings.json').read_text(encoding='utf-8')))
+            _, settings = project_configuration(path, {}, defaults)
+            enabled = path is not None and completion_review_enabled(settings['direct'])
         except (OSError, ValueError, AttributeError):
             self.with_debug.setEnabled(False)
             return
         signals_blocked = self.with_debug.blockSignals(True)
         self.with_debug.setChecked(enabled)
         self.with_debug.blockSignals(signals_blocked)
-        self.with_debug.setEnabled(not self.task)
+        self.with_debug.setEnabled(path is not None and not self.task)
 
     def save_debug_checkbox(self, enabled):
-        path = self.data.root / 'settings.json'
+        path = self.project_settings_path()
+        if path is None:
+            return
         try:
-            settings = json.loads(path.read_text(encoding='utf-8'))
-            section = 'pipeline' if 'direct' not in settings and 'pipeline' in settings else 'direct'
-            direct = settings.setdefault(section, {})
+            defaults = normalize_settings(json.loads((self.data.root / 'settings.json').read_text(encoding='utf-8')))
+            try:
+                project = json.loads(path.read_text(encoding='utf-8'))
+            except FileNotFoundError:
+                project = {}
+            direct = project.setdefault('settings', {}).setdefault('direct', defaults['direct'])
             set_completion_review(direct, enabled)
-            atomic_text(path, json.dumps(settings, ensure_ascii=False, indent=2))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_text(path, json.dumps(project, ensure_ascii=False, indent=2))
         except (OSError, ValueError, AttributeError) as error:
             self.sync_debug_checkbox()
             QMessageBox.warning(self, 'Orchestra Settings', str(error))
 
     def open_settings(self):
+        path = self.project_settings_path()
+        if path is not None and not self.task:
+            self.show_settings(project_path=path)
+
+    def open_global_settings(self):
+        self.show_settings(global_only=True)
+
+    def show_settings(self, **scope):
         try:
-            if SettingsDialog(self, self.data).exec():
-                self.sync_debug_checkbox()
-                if not self.task:
-                    self.refresh()
+            if SettingsDialog(self, self.data, **scope).exec():
+                self.refresh()
         except (OSError, ValueError, KeyError, TypeError) as error:
             QMessageBox.warning(self, 'Orchestra Settings', str(error))
 
@@ -845,7 +880,7 @@ class DesktopWindow(QMainWindow):
         return True
 
     def start(self, method):
-        if self.task:
+        if self.task or self.closing:
             return
         text = self.prompt.toPlainText().strip()
         if method == 'new_task' and not text:
@@ -862,87 +897,103 @@ class DesktopWindow(QMainWindow):
         if self.selected_run:
             self.output.clear()
         self.selected_run = None
-        self.run_workspace = self.workspace
-        self.run_view = None
-        self.pending_run_output.clear()
-        self.stream_item = None
+        workspace = self.workspace.resolve()
+        run = ProjectRun(view=(self.output.toPlainText(), ''))
+        self.runs[workspace] = run
         self.reasoning.clear()
-        self.started_at = time.monotonic()
-        self.activity = 'Starting'
-        self.progress_bar.show()
-        self.set_busy(True)
-        self.task = self.loop.create_task(self.run(app, method, text))
+        run.task = self.loop.create_task(self.run(app, method, text, workspace))
+        self.reload_projects()
+        self.refresh_run_controls()
 
-    def set_busy(self, busy):
-        for widget in (self.start_button, self.review_button, self.continue_button):
-            widget.setEnabled(not busy)
-        self.stop_button.setEnabled(busy)
-        self.with_debug.setEnabled(not busy)
+    @property
+    def current_run(self):
+        return self.runs.get(self.workspace.resolve()) if self.workspace else None
 
-    def viewing_run(self):
-        return self.run_workspace == self.workspace and self.selected_run is None
+    @property
+    def task(self):
+        run = self.current_run
+        return run.task if run else None
+
+    def refresh_run_controls(self):
+        task = self.task
+        busy = task is not None
+        for widget in (self.start_button, self.review_button):
+            widget.setEnabled(not busy and not self.closing)
+        self.continue_button.setEnabled(not busy and not self.closing and self.selected_run is None)
+        self.stop_button.setEnabled(busy and not task.done() and not task.cancelling())
+        self.with_debug.setEnabled(self.workspace is not None and not busy)
+        self.project_settings_button.setEnabled(self.workspace is not None and not busy)
+        self.progress_bar.setVisible(busy)
+        self.update_activity()
+
+    def viewing_run(self, workspace):
+        return (self.workspace is not None and self.workspace.resolve() == workspace
+                and self.selected_run is None)
 
     def store_run_view(self):
-        if self.run_workspace is not None and self.viewing_run():
-            self.run_view = (self.output.toPlainText(), self.reasoning.toPlainText())
+        if self.current_run and self.selected_run is None:
+            self.current_run.view = (self.output.toPlainText(), self.reasoning.toPlainText())
 
     def restore_run_view(self):
-        if not self.viewing_run() or self.run_view is None:
+        run = self.current_run
+        if not run or self.selected_run is not None:
             return
-        output, reasoning = self.run_view
+        output, reasoning = run.view
         self.output.setPlainText(output)
         self.reasoning.setPlainText(reasoning)
-        pending, self.pending_run_output = self.pending_run_output, []
+        pending, run.pending = run.pending, []
+        workspace = self.workspace.resolve()
         for kind, payload in pending:
             if kind == 'progress':
-                self.progress(payload)
+                self.progress(payload, workspace)
             else:
-                self.append_run_output(payload)
-        if self.task is None:
-            self.flush_reasoning_escape()
+                self.append_run_output(payload, workspace)
+        if run.task is None:
+            self.flush_reasoning_escape(run)
 
-    def append_run_output(self, text):
-        if self.viewing_run():
+    def append_run_output(self, text, workspace):
+        if self.viewing_run(workspace):
             self.output.appendPlainText(text)
         else:
-            self.pending_run_output.append(('text', text))
+            self.runs[workspace].pending.append(('text', text))
 
-    async def run(self, app, method, text):
+    async def run(self, app, method, text, workspace):
         try:
-            result = await getattr(app, method)(text, on_progress=self.progress)
-            self.append_run_output(result.get('answer') or result.get('error') or result['status'])
-            self.append_run_output('Log: ' + result['log_directory'])
+            result = await getattr(app, method)(text, on_progress=lambda event: self.progress(event, workspace))
+            self.append_run_output(result.get('answer') or result.get('error') or result['status'], workspace)
+            self.append_run_output('Log: ' + result['log_directory'], workspace)
         except asyncio.CancelledError:
-            self.append_run_output('Task stopped. You can resume it.')
+            self.append_run_output('Task stopped. You can resume it.', workspace)
         except (OSError, ValueError, RuntimeError) as error:
-            self.append_run_output(str(error))
+            self.append_run_output(str(error), workspace)
         finally:
             await asyncio.gather(*(client.close() for client in app.engine.clients.values()),
                                  return_exceptions=True)
 
-    def progress(self, event):
-        if self.run_workspace is not None and not self.viewing_run():
-            self.pending_run_output.append(('progress', event))
+    def progress(self, event, workspace):
+        run = self.runs[workspace]
+        if not self.viewing_run(workspace):
+            run.pending.append(('progress', event))
             return
         kind = event['kind']
         if kind in {'reasoning', 'model_text', 'edit_draft'}:
             label = {'reasoning': event.get('model', ''), 'model_text': 'Model response',
                      'edit_draft': f"Draft · {event.get('name', '')}"}[kind]
             item = (event['request_id'], kind, event.get('item_id'))
-            if self.stream_item != item:
-                self.flush_reasoning_escape()
-                self.append(self.reasoning, ('\n\n' if self.stream_item else '') + label + '\n')
-                self.stream_item = item
+            if run.stream_item != item:
+                self.flush_reasoning_escape(run)
+                self.append(self.reasoning, ('\n\n' if run.stream_item else '') + label + '\n')
+                run.stream_item = item
             text = event['text']
             if kind in {'reasoning', 'edit_draft'}:
-                text = self.format_reasoning_chunk(text, json_preview=kind == 'edit_draft')
+                text = self.format_reasoning_chunk(run, text, json_preview=kind == 'edit_draft')
             self.append(self.reasoning, text)
-            self.activity = label
+            run.activity = label
         elif kind == 'model':
-            self.activity = 'Waiting for · ' + event['model']
+            run.activity = 'Waiting for · ' + event['model']
             self.output.appendPlainText('Model: ' + event['model'])
         elif kind == 'tool':
-            self.activity = 'Running · ' + event['name']
+            run.activity = 'Running · ' + event['name']
             self.output.appendPlainText('Tool: ' + event['name'])
         elif kind == 'started':
             self.output.appendPlainText(event['topic'])
@@ -951,7 +1002,8 @@ class DesktopWindow(QMainWindow):
         elif kind == 'verification':
             self.output.appendPlainText('Check ' + event['name'] + (' passed' if event['passed'] else ' failed'))
         elif kind == 'usage':
-            self.status.setText(f"{event['tokens']} tokens · ${event['spent']:.4f}")
+            run.status = f"{event['tokens']} tokens · ${event['spent']:.4f}"
+            self.status.setText(run.status)
         elif kind == 'project_usage_error':
             self.output.appendPlainText('Could not save project usage: ' + event['message'])
         elif kind == 'stopped':
@@ -960,14 +1012,14 @@ class DesktopWindow(QMainWindow):
             if 'cost' in event:
                 self.write_cost(event['cost'])
 
-    def format_reasoning_chunk(self, text, *, json_preview=False):
-        text = self.reasoning_escape + text
-        self.reasoning_escape = ''
+    def format_reasoning_chunk(self, run, text, *, json_preview=False):
+        text = run.reasoning_escape + text
+        run.reasoning_escape = ''
 
         def decode(match):
             escape = match.group()
             if len(escape) == 1:
-                self.reasoning_escape = escape
+                run.reasoning_escape = escape
                 return ''
             if json_preview and escape[1] in ('"', '\\'):
                 return escape[1]
@@ -975,26 +1027,31 @@ class DesktopWindow(QMainWindow):
 
         return re.sub(r'\\(?:[ntr"\\]|\Z)', decode, text)
 
-    def flush_reasoning_escape(self):
-        if self.reasoning_escape:
-            self.append(self.reasoning, self.reasoning_escape)
-            self.reasoning_escape = ''
+    def flush_reasoning_escape(self, run):
+        if run.reasoning_escape:
+            self.append(self.reasoning, run.reasoning_escape)
+            run.reasoning_escape = ''
 
     def write_cost(self, cost):
         suffix = '' if cost['complete'] else ' (incomplete data)'
         self.output.appendPlainText(f"Run cost: ${cost['estimated_usd']:.5f}{suffix}")
 
     def stop(self):
-        if self.task and not self.task.done() and not self.task.cancelling():
-            self.activity = 'Stopping'
-            self.stop_button.setEnabled(False)
-            self.task.cancel()
+        run = self.current_run
+        if run and run.task and not run.task.done() and not run.task.cancelling():
+            run.activity = 'Stopping'
+            run.task.cancel()
+            self.refresh_run_controls()
 
     def closeEvent(self, event):
-        if self.task:
+        active = [run.task for run in self.runs.values() if run.task is not None]
+        if active:
             event.ignore()
             self.closing = True
-            self.stop()
+            for task in active:
+                if not task.done() and not task.cancelling():
+                    task.cancel()
+            self.refresh_run_controls()
         else:
             self.timer.stop()
             try:
@@ -1006,26 +1063,36 @@ class DesktopWindow(QMainWindow):
     def tick(self):
         self.loop.call_soon(self.loop.stop)
         self.loop.run_forever()
-        if not self.task:
-            return
-        if not self.task.done():
-            minutes, seconds = divmod(int(time.monotonic() - self.started_at), 60)
-            activity = self.activity if self.viewing_run() else 'Running in ' + self.run_workspace.name
-            self.activity_label.setText(f'{activity} · {minutes:02d}:{seconds:02d}')
-            return
-        if not self.task.cancelled() and self.task.exception():
-            self.append_run_output('Run failed: ' + type(self.task.exception()).__name__)
-        if self.viewing_run():
-            self.flush_reasoning_escape()
-        self.task = None
-        if self.closing:
+        finished = False
+        for workspace, run in self.runs.items():
+            if run.task is None or not run.task.done():
+                continue
+            if not run.task.cancelled() and run.task.exception():
+                self.append_run_output('Run failed: ' + type(run.task.exception()).__name__, workspace)
+            if self.viewing_run(workspace):
+                self.flush_reasoning_escape(run)
+            run.task = None
+            finished = True
+        if self.closing and not any(run.task is not None for run in self.runs.values()):
             self.close()
             return
-        self.progress_bar.hide()
-        self.activity_label.clear()
-        self.set_busy(False)
-        self.reload_projects()
-        self.refresh()
+        if finished:
+            self.reload_projects()
+            self.refresh()
+        self.update_activity()
+
+    def update_activity(self):
+        run = self.current_run
+        active_count = sum(project.task is not None for project in self.runs.values())
+        if run and run.task is not None:
+            minutes, seconds = divmod(int(time.monotonic() - run.started_at), 60)
+            text = f'{run.activity} · {minutes:02d}:{seconds:02d}'
+            active_count -= 1
+        else:
+            text = ''
+        if active_count:
+            text += (' · ' if text else '') + f'Other running projects: {active_count}'
+        self.activity_label.setText(text)
 
 
 def apply_desktop_theme(qt):
