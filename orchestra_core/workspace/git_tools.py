@@ -215,7 +215,8 @@ class RepositoryTools:
         if self._run(['remote', 'get-url', '--push', '--', remote], check=False)['returncode']:
             raise ToolError('push_remote_missing', 'Set the project’s push remote before starting.')
         if self._run(['rev-parse', '--verify', source], check=False)['returncode']:
-            raise ToolError('push_no_commit', 'Git needs a first commit before Orchestra can check the push.')
+            # An unborn branch has no source ref for a dry-run push.
+            return
         result = self._run(['push', '--dry-run', '--no-verify', '--no-follow-tags', '--',
                             remote, f'{source}:{destination}'], check=False)
         self._check_push_result(result)

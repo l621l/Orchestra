@@ -45,6 +45,20 @@ class RepositoryReliability(unittest.TestCase):
             self.assertEqual(self.git('ls-remote', '--heads', 'origin').splitlines(),
                              [self.git('rev-parse', 'HEAD').strip() + '\trefs/heads/publish-test'])
 
+    def test_push_preflight_defers_until_first_commit(self):
+        repo = RepositoryTools(self.root)
+        with self.assertRaises(ToolError) as missing:
+            repo.check_push()
+        self.assertEqual(missing.exception.code, 'push_remote_missing')
+        with tempfile.TemporaryDirectory() as remote:
+            subprocess.run(['git', 'init', '-q', '--bare', remote], check=True)
+            self.git('remote', 'add', 'origin', remote)
+            repo.check_push()
+            self.write('file.txt', 'first change')
+            self.commit()
+            repo.check_push()
+            self.assertTrue(repo.git_push()['pushed'])
+
     def test_pull_updates_from_upstream_and_rejects_dirty_worktree(self):
         self.write('file.txt', 'before')
         self.commit()
