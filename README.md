@@ -2,13 +2,14 @@
 
 Run coding agents in several local projects at once. Each project has its own model choices, budget, Git permissions, and run history.
 
-## Desktop
+## Desktop quick start
 
-On Windows, install Python and Git, then run:
+Run the launcher from the Orchestra directory.
+
+On Windows, run:
 
 ```powershell
-py -m pip install -r requirements-qt.txt
-py -B orchestra_qt.py
+.\start-windows.cmd
 ```
 
 On Ubuntu or Debian, including WSL with GUI support, run:
@@ -17,7 +18,29 @@ On Ubuntu or Debian, including WSL with GUI support, run:
 bash start-linux.sh
 ```
 
-The Linux launcher creates a virtual environment and installs missing dependencies. It may ask for your sudo password to install system packages.
+Both launchers create a virtual environment and install Python packages. The Windows launcher can install Python and Git through WinGet. The Linux launcher uses APT for system packages.
+
+### Manual setup
+
+**Windows.** Install Python 3.11 or newer with the Python launcher and make sure Git is on PATH. Then run:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-qt.txt
+.\.venv\Scripts\python.exe -B orchestra_qt.py
+```
+
+**Ubuntu or Debian.** Use a graphical session or WSL with GUI support, then run:
+
+```bash
+sudo apt update
+sudo apt install git python3 python3-venv libxcb-cursor0
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-qt.txt
+.venv/bin/python -B orchestra_qt.py
+```
+
+### First run
 
 1. In **Global Settings**, configure a provider, its API key, and model prices.
 2. Create or add a project. In **Project Settings**, select the executor and reviewer, set limits, and configure Git permissions.
