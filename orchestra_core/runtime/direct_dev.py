@@ -490,11 +490,10 @@ class DirectDevelopment(Orchestra):
         rates = self.pricing['providers'][config['provider']][config['model']]
         wire = (responses_transport.input_items(messages) if config['transport'] == 'responses'
                 else wire_messages(messages, config))
-        cap, money_status = request_budget(remaining, rates,
+        cap = request_budget(remaining, rates,
             wire + [{'role': 'system', 'content': resource_status}], tools,
             kwargs.get('max_output_tokens') or self.settings['generation']['max_output_tokens'])
         kwargs['max_output_tokens'] = cap
-        resource_status += f'\nStage: {stage}; allowance ${limit:.5f}; spent ${spent:.5f}.' + money_status
         self.fit_history(messages, tools, resource_status, force_final, cap)
         trace.progress('model', role=selected, model=config['model'])
         trace.event('model_request', task_id=task_id, role=selected, model=config['model'], reason=reason)

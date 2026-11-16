@@ -71,11 +71,11 @@ class CompletionReviewBlock:
         prompt = REVIEW_PROMPT
         if instructions:
             prompt += '\nAdditional review priorities from settings:\n' + instructions
-        prompt += ('\nOnce a defect is confirmed, prioritize its smallest viable fix and a focused '
-                   'regression check before exploring more requirements. Batch related confirmed fixes '
-                   'when practical, reuse successful checks for unchanged behavior, and avoid repeating '
-                   'the baseline until an edit affects it. Preserve unrelated work. If funds are low, '
-                   'prioritize the highest-impact confirmed defect and report the remaining gaps.')
+        prompt += ('\nWhen you reproduce a defect within the requested scope and have enough source '
+                   'evidence to fix it, use the next tool call to apply the smallest viable edit. '
+                   'Then run a focused regression check before resuming the audit. If a fix is unsafe '
+                   'or blocked, record the concrete reason and continue with the remaining requirements. '
+                   'Reuse successful checks for unchanged behavior. Preserve unrelated work.')
         prompt += engine.git_prompt_suffix()
         messages = [{'role': 'system', 'content': prompt},
                     {'role': 'user', 'content': json.dumps(evidence, ensure_ascii=False)}]

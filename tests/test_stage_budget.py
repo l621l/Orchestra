@@ -14,20 +14,19 @@ class BudgetMath(unittest.TestCase):
         self.assertEqual(allowance(options, False, False), 1)
 
     def test_output_clamps_to_remaining_money(self):
-        cap, hint = request_budget(.02, {'input_cache_miss': 2, 'output': 10}, [], [], 8192)
+        cap = request_budget(.02, {'input_cache_miss': 2, 'output': 10}, [], [], 8192)
         self.assertLess(cap, 2000)
-        self.assertIn('$0.02000', hint)
-        self.assertIn('including reasoning', hint)
 
-    def test_input_estimate_cannot_block_request_with_positive_balance(self):
+    def test_budget_requires_input_and_minimum_output(self):
         rates = {'input_cache_miss': 2, 'output': 10}
-        cap, _ = request_budget(.001, rates, ['x' * 10000], [], 8192)
-        self.assertEqual(cap, 256)
-        cap, _ = request_budget(.001, rates, ['x' * 10000], [], 128)
-        self.assertEqual(cap, 128)
+        with self.assertRaises(TaskCostLimit):
+            request_budget(.001, rates, ['x' * 10000], [], 8192)
+        with self.assertRaises(TaskCostLimit):
+            request_budget(.002, rates, [], [], 8192)
+        self.assertEqual(request_budget(.002, rates, [], [], 128), 128)
 
     def test_zero_output_price_still_counts_input(self):
-        cap, _ = request_budget(1, {'input_cache_miss': 2, 'output': 0}, [], [], 8192)
+        cap = request_budget(1, {'input_cache_miss': 2, 'output': 0}, [], [], 8192)
         self.assertEqual(cap, 8192)
         with self.assertRaises(TaskCostLimit):
             request_budget(0, {'input_cache_miss': 2, 'output': 0}, [], [], 8192)
@@ -55,7 +54,7 @@ class StageBudgetIntegration(unittest.IsolatedAsyncioTestCase):
                                            self.trace, self.parent, False, max_output_tokens=8192)
             self.assertEqual(transport.await_count, 1)
 
-    async def test_reviewer_receives_money_guidance_and_charges_own_stage(self):
+    async def test_reviewer_charges_own_stage_without_money_guidance(self):
         app = self.app
         app.options.update(max_task_cost_usd=1, completion_review_enabled=True)
         app.load_or_start('Review code')
@@ -64,8 +63,8 @@ class StageBudgetIntegration(unittest.IsolatedAsyncioTestCase):
         usage = {}
 
         async def reply(engine, role, messages, tools, status, usage, *args, **kwargs):
-            self.assertIn('allowance $0.20000', status)
-            self.assertIn('approximately $0.20000 remaining', status)
+            self.assertNotIn('STAGE MONEY BUDGET', status)
+            self.assertNotIn('$0.20000', status)
             entry = engine.begin_usage(usage, kwargs['label'], role, 'mimo', 'mimo-v2.6-pro')
             engine.add_usage(entry, {'prompt_tokens': 100, 'completion_tokens': 100, 'total_tokens': 200}, None)
             return {'role': 'assistant', 'content': 'done'}
