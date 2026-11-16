@@ -34,7 +34,7 @@ class RepositoryReliability(unittest.TestCase):
     def test_push_publishes_current_branch_and_sets_upstream(self):
         self.write('file.txt', 'committed content')
         self.commit()
-        self.git('switch', '-c', 'publish-test')
+        self.git('checkout', '-b', 'publish-test')
         with tempfile.TemporaryDirectory() as remote:
             subprocess.run(['git', 'init', '-q', '--bare', remote], check=True)
             self.git('remote', 'add', 'origin', remote)
@@ -48,7 +48,7 @@ class RepositoryReliability(unittest.TestCase):
     def test_pull_updates_from_upstream_and_rejects_dirty_worktree(self):
         self.write('file.txt', 'before')
         self.commit()
-        branch = self.git('branch', '--show-current').strip()
+        branch = self.git('symbolic-ref', '--short', 'HEAD').strip()
         with tempfile.TemporaryDirectory() as upstream:
             subprocess.run(['git', 'clone', '-q', str(self.root), upstream], check=True)
             self.git('remote', 'add', 'origin', upstream)

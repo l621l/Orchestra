@@ -545,13 +545,16 @@ class DesktopWindow(QMainWindow):
             self.reload_projects()
             self.refresh()
 
-    def pick_folder(self, title, accept, parent=None):
+    def pick_folder(self, title, accept, parent=None, *, initial_directory=''):
         dialog = QFileDialog(parent if parent is not None else self)
         dialog.setOption(QFileDialog.Option.DontUseNativeDialog)
         dialog.setFileMode(QFileDialog.FileMode.Directory)
         dialog.setOption(QFileDialog.Option.ShowDirsOnly)
         dialog.setWindowTitle(title)
-        dialog.setDirectory(str(self.workspace or Path.home()))
+        initial = Path(initial_directory.strip()).expanduser() if initial_directory.strip() else None
+        if initial is None or not initial.is_dir():
+            initial = self.workspace if self.workspace and self.workspace.is_dir() else Path.home()
+        dialog.setDirectory(str(initial))
         dialog.setLabelText(QFileDialog.DialogLabel.Accept, accept)
         dialog.setLabelText(QFileDialog.DialogLabel.Reject, 'Cancel')
         if dialog.exec():
@@ -574,7 +577,7 @@ class DesktopWindow(QMainWindow):
         error_label.setWordWrap(True)
 
         def browse():
-            folder = self.pick_folder('Parent folder', 'Select', dialog)
+            folder = self.pick_folder('Parent folder', 'Select', dialog, initial_directory=location.text())
             if folder is not None:
                 location.setText(str(folder))
 
@@ -588,7 +591,7 @@ class DesktopWindow(QMainWindow):
             dialog.accept()
 
         def add_existing():
-            folder = self.pick_folder('Add Existing Project', 'Add', dialog)
+            folder = self.pick_folder('Add Existing Project', 'Add', dialog, initial_directory=location.text())
             if folder is None:
                 return
             try:
@@ -631,7 +634,8 @@ class DesktopWindow(QMainWindow):
                 with workspace_lease(folder):
                     repo = self.git('rev-parse', '--is-inside-work-tree', check=False, folder=folder)
                     if repo.stdout.strip() != 'true' and not (folder / '.git').exists():
-                        self.git('init', '--initial-branch=main', folder=folder)
+                        self.git('init', folder=folder)
+                        self.git('symbolic-ref', 'HEAD', 'refs/heads/main', folder=folder)
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 try:
                     folder.rmdir()
@@ -885,7 +889,7 @@ class DesktopWindow(QMainWindow):
     def create_branch(self, commit=None):
         branch, accepted = QInputDialog.getText(self, 'Git', 'New branch name')
         if accepted and branch.strip():
-            return self.git_change('switch', '-c', branch.strip(), '--', *([commit] if commit else []))
+            return self.git_change('checkout', '-b', branch.strip(), *([commit] if commit else []))
         return False
 
     def set_origin(self):

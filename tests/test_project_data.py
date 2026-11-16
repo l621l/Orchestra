@@ -21,7 +21,8 @@ class ProjectDataTests(unittest.TestCase):
                 return subprocess.run(['git', '-C', str(workspace), *args], check=check,
                                       capture_output=True, encoding='utf-8')
 
-            git('init', '-q', '-b', 'main')
+            git('init', '-q')
+            git('symbolic-ref', 'HEAD', 'refs/heads/main')
             git('config', 'user.name', 'Test')
             git('config', 'user.email', 'test@example.invalid')
             journal = '{"time":"2026-01-01","event":"run_started"}\n'
@@ -30,19 +31,19 @@ class ProjectDataTests(unittest.TestCase):
             (workspace / 'user.txt').write_text('base', encoding='utf-8')
             git('add', '--', JOURNAL, MAP, 'user.txt')
             git('commit', '-qm', 'Base')
-            git('switch', '-qc', 'other')
+            git('checkout', '-q', '-b', 'other')
             (workspace / MAP).write_text(HEADER + 'other', encoding='utf-8')
             (workspace / JOURNAL).write_text(journal.replace('run_started', 'run_finished'), encoding='utf-8')
             git('commit', '-qam', 'Other branch')
-            git('switch', '-q', 'main')
+            git('checkout', '-q', 'main')
             updated = journal + '{"time":"2026-01-02","event":"edit"}\n'
             (workspace / JOURNAL).write_text(updated, encoding='utf-8')
             (workspace / MAP).write_text(HEADER + 'local', encoding='utf-8')
             (workspace / 'user.txt').write_text('keep', encoding='utf-8')
-            self.assertNotEqual(git('switch', 'other', check=False).returncode, 0)
+            self.assertNotEqual(git('checkout', 'other', check=False).returncode, 0)
             storage = project_data_path(base / 'logs', workspace)
             self.assertEqual(preserve_legacy_checkout_changes(workspace, storage, git), [JOURNAL, MAP])
-            git('switch', 'other')
+            git('checkout', 'other')
             self.assertEqual((storage / JOURNAL).read_text(encoding='utf-8'), updated)
             self.assertEqual(next(storage.glob('legacy-*-' + MAP)).read_text(encoding='utf-8'),
                              HEADER + 'local')

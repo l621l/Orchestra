@@ -174,9 +174,12 @@ class RepositoryTools:
         output = self._run(arguments)["stdout"]
         return [path for path in output.split("\0") if path]
 
+    def _current_branch(self):
+        return self._run(['symbolic-ref', '--quiet', '--short', 'HEAD'], check=False)['stdout'].strip()
+
     def _push_refs(self, expected_head=None):
         self._require_repository()
-        branch = self._run(['branch', '--show-current'])['stdout'].strip()
+        branch = self._current_branch()
         if not branch:
             raise ToolError('detached_head', 'Select a local branch before pushing.')
         if expected_head is not None and self._run(
@@ -226,7 +229,7 @@ class RepositoryTools:
 
     def git_pull(self):
         self._require_repository()
-        if not self._run(['branch', '--show-current'])['stdout'].strip():
+        if not self._current_branch():
             raise ToolError('detached_head', 'Select a local branch before pulling.')
         upstream = self._run(['rev-parse', '--abbrev-ref', '@{upstream}'], check=False)
         if upstream['returncode']:
@@ -234,7 +237,8 @@ class RepositoryTools:
         if self._run(['status', '--porcelain', '--untracked-files=all'])['stdout']:
             raise ToolError('dirty_worktree', 'Save local changes before pulling.')
         before = self._run(['rev-parse', 'HEAD'])['stdout'].strip()
-        result = self._run(['pull', '--ff-only', '--no-rebase', '--no-autostash'], check=False)
+        result = self._run(['-c', 'rebase.autoStash=false', '-c', 'merge.autoStash=false',
+                            'pull', '--ff-only', '--no-rebase'], check=False)
         if result['returncode']:
             raise ToolError('pull_failed', 'Fast-forward pull failed. Check remote access and whether the branch diverged.')
         head = self._run(['rev-parse', 'HEAD'])['stdout'].strip()
@@ -242,7 +246,7 @@ class RepositoryTools:
 
     def git_status(self):
         self._require_repository()
-        branch = self._run(["branch", "--show-current"])["stdout"].strip()
+        branch = self._current_branch()
         raw = self._run(["status", "--porcelain=v1", "-z",
                          "--untracked-files=all"])["stdout"]
         tokens = raw.split("\0")
@@ -492,7 +496,7 @@ class RepositoryTools:
         if self._changed_paths(staged=True):
             raise ToolError('staged_changes_present', 'Resolve pre-existing staged changes before creating a branch.')
         previous = self._run(['symbolic-ref', '--quiet', '--short', 'HEAD'], check=False)['stdout'].strip() or None
-        self._run(['switch', '-c', name])
+        self._run(['checkout', '-b', name])
         # Do not turn successful mutation into an error if optional inspection fails.
         status, warnings = None, []
         try:

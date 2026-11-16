@@ -74,6 +74,7 @@ class QtDesktopTests(unittest.TestCase):
             tree = global_dialog.catalog_tree
             for row in range(tree.topLevelItemCount()):
                 provider = tree.topLevelItem(row)
+                self.assertFalse(provider.isExpanded())
                 provider.setCheckState(0, Qt.CheckState.Checked if provider.text(0) == 'gpt'
                                        else Qt.CheckState.Unchecked)
                 if provider.text(0) == 'gpt':
@@ -84,6 +85,9 @@ class QtDesktopTests(unittest.TestCase):
             self.assertEqual(global_dialog.writer_provider.currentText(), 'gpt')
             self.assertEqual([global_dialog.model.itemText(i) for i in range(global_dialog.model.count())],
                              ['gpt-6.1-sol'])
+            global_dialog.catalog_search.setText('gpt-6.1-sol')
+            self.assertFalse(any(tree.topLevelItem(i).isExpanded()
+                                 for i in range(tree.topLevelItemCount())))
             global_dialog.save()
             reopened = SettingsDialog(None, data, global_only=True)
             self.assertEqual(reopened.writer_provider.count(), 1)
@@ -100,6 +104,26 @@ class QtDesktopTests(unittest.TestCase):
             self.assertEqual([dialog.review_model.itemText(i) for i in range(dialog.review_model.count())],
                              ['gpt-6.1-sol'])
             dialog.close()
+
+    def test_folder_picker_opens_at_typed_directory(self):
+        from PySide6.QtWidgets import QFileDialog
+
+        with tempfile.TemporaryDirectory() as temporary, asyncio.Runner() as runner:
+            root = Path(temporary)
+            data = DesktopData(Path(__file__).resolve().parents[1], root / 'data')
+            data.initialize()
+            typed = root / 'typed folder'
+            typed.mkdir()
+            window = DesktopWindow(data, runner.get_loop(), root)
+            try:
+                def inspect(dialog):
+                    self.assertEqual(Path(dialog.directory().absolutePath()), typed)
+                    return 0
+
+                with patch.object(QFileDialog, 'exec', inspect):
+                    window.pick_folder('Parent folder', 'Select', initial_directory=str(typed))
+            finally:
+                window.close()
 
     def test_opening_click_release_does_not_select_a_combo_item(self):
         from PySide6.QtCore import QEvent, QPointF, Qt

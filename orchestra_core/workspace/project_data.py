@@ -53,6 +53,6 @@ def preserve_legacy_checkout_changes(workspace, storage, git):
         if name == JOURNAL and not (storage / name).exists():
             atomic_text(storage / name, current)
         if path.read_text(encoding='utf-8') == current:
-            git('restore', '--worktree', '--', name)
+            git('checkout', '--', name)
             restored.append(name)
     return restored

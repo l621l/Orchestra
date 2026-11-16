@@ -18,11 +18,11 @@ On Ubuntu or Debian, including WSL with GUI support, run:
 bash start-linux.sh
 ```
 
-Both launchers create a virtual environment and install Python packages. The Windows launcher can install Python and Git through WinGet. The Linux launcher uses APT for system packages.
+Both launchers create a virtual environment and install Python packages. On Windows, WinGet installs Python if needed. The Linux launcher uses APT for system packages. To use Git features, make sure Git is on PATH.
 
 ### Manual setup
 
-**Windows.** Install Python 3.11 or newer with the Python launcher and make sure Git is on PATH. Then run:
+**Windows.** Install Python 3.11 or newer with the Python launcher, then run:
 
 ```powershell
 py -3 -m venv .venv
@@ -34,7 +34,7 @@ py -3 -m venv .venv
 
 ```bash
 sudo apt update
-sudo apt install git python3 python3-venv libxcb-cursor0
+sudo apt install python3 python3-venv libxcb-cursor0
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-qt.txt
 .venv/bin/python -B orchestra_qt.py

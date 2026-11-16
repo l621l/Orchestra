@@ -111,7 +111,7 @@ class CommitTools(unittest.TestCase):
         (self.root / 'a.txt').write_text('uncommitted')
         result = self.repo.execute('git_create_branch', {'name': 'feat/first-project'})
         self.assertTrue(result['created'])
-        self.assertEqual(self.git('branch', '--show-current'), 'feat/first-project')
+        self.assertEqual(self.git('symbolic-ref', '--short', 'HEAD'), 'feat/first-project')
         self.assertEqual((self.root / 'a.txt').read_text(), 'uncommitted')
         self.assertEqual(self.git('diff', '--cached', '--name-only'), '')
 
@@ -148,7 +148,7 @@ class CommitTools(unittest.TestCase):
             result = self.repo.git_create_branch('feat/new')
         self.assertTrue(result['created'])
         self.assertTrue(result['warnings'])
-        self.assertEqual(self.git('branch', '--show-current'), 'feat/new')
+        self.assertEqual(self.git('symbolic-ref', '--short', 'HEAD'), 'feat/new')
 
     def test_missing_identity_is_reported_before_staging(self):
         self.baseline()

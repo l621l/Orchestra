@@ -6,14 +6,6 @@ if not defined ORCHESTRA_VENV set "ORCHESTRA_VENV=%LOCALAPPDATA%\Orchestra\venv"
 for %%I in ("%ORCHESTRA_VENV%") do set "ORCHESTRA_VENV=%%~fI"
 set "ORCHESTRA_PYTHON=%ORCHESTRA_VENV%\Scripts\python.exe"
 
-call :find_git
-if errorlevel 1 (
-    call :install Git.Git
-    if errorlevel 1 goto :failed
-    call :find_git
-    if errorlevel 1 goto :reopen
-)
-
 "%ORCHESTRA_PYTHON%" -m pip --version >nul 2>&1
 if not errorlevel 1 goto :dependencies
 
@@ -51,17 +43,6 @@ set "ORCHESTRA_EXIT=%errorlevel%"
 popd
 exit /b %ORCHESTRA_EXIT%
 
-:find_git
-git --version >nul 2>&1
-if not errorlevel 1 exit /b 0
-for %%D in ("%ProgramFiles%\Git\cmd" "%LOCALAPPDATA%\Programs\Git\cmd") do (
-    if exist "%%~D\git.exe" (
-        set "PATH=%%~D;%PATH%"
-        exit /b 0
-    )
-)
-exit /b 1
-
 :find_python
 set "ORCHESTRA_BASE_PYTHON="
 for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable if sys.version_info[:2] >= (3, 11) else '')" 2^>nul') do set "ORCHESTRA_BASE_PYTHON=%%P"
@@ -81,7 +62,7 @@ exit /b 0
 :install
 where winget.exe >nul 2>&1
 if errorlevel 1 (
-    echo WinGet is unavailable. Install App Installer or install Python 3.11+ and Git manually. 1>&2
+    echo WinGet is unavailable. Install App Installer or install Python 3.11+ manually. 1>&2
     exit /b 1
 )
 winget install --id %1 --exact --source winget --accept-package-agreements --accept-source-agreements %2 %3

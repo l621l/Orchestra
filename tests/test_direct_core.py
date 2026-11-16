@@ -32,7 +32,8 @@ class DirectCore(unittest.IsolatedAsyncioTestCase):
         topic = 'Create main.py. Commit and push after verification.'
         with tempfile.TemporaryDirectory() as remote:
             git(remote, 'init', '--bare', '-q')
-            git(self.root, 'init', '-q', '-b', 'main')
+            git(self.root, 'init', '-q')
+            git(self.root, 'symbolic-ref', 'HEAD', 'refs/heads/main')
             git(self.root, 'config', 'user.name', 'Test')
             git(self.root, 'config', 'user.email', 'test@example.invalid')
             git(self.root, 'remote', 'add', 'origin', remote)

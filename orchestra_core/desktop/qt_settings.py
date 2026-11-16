@@ -16,7 +16,7 @@ from orchestra_core.desktop.desktop_options import DEFAULT_CONFIG, LIMITS, MODEL
 from orchestra_core.workspace.interface_notes import atomic_text
 from orchestra_core.models.model_routing import role_settings, reasoning_levels
 from orchestra_core.models.model_catalog import (
-    CATALOG_URL, DEFAULT_SELECTED, DIRECT_PROVIDERS, catalog_rates, default_selection, discover_providers,
+    CATALOG_URL, DIRECT_PROVIDERS, catalog_rates, default_selection, discover_providers,
     update_prices,
 )
 from orchestra_core.runtime.orchestra_config import (
@@ -333,6 +333,9 @@ class SettingsDialog(QDialog):
         self.show_model_rates()
 
     def render_catalog(self, selection, changes=None):
+        expanded = {item.data(0, Qt.ItemDataRole.UserRole)
+                    for index in range(self.catalog_tree.topLevelItemCount())
+                    if (item := self.catalog_tree.topLevelItem(index)).isExpanded()}
         blocked = self.catalog_tree.blockSignals(True)
         self.catalog_tree.clear()
         checked, unchecked = Qt.CheckState.Checked, Qt.CheckState.Unchecked
@@ -376,7 +379,7 @@ class SettingsDialog(QDialog):
                 row.setToolTip(0, detail)
                 for column in range(1, self.catalog_tree.columnCount()):
                     row.setTextAlignment(column, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            parent.setExpanded(provider in DEFAULT_SELECTED or settings.get('enabled', False))
+            parent.setExpanded(provider in expanded)
         self.catalog_tree.blockSignals(blocked)
         self.search_catalog(self.catalog_search.text())
         self.refresh_catalog_picker()
@@ -393,8 +396,6 @@ class SettingsDialog(QDialog):
                 child.setHidden(not matches)
                 any_model |= matches
             parent.setHidden(not matches_provider and not any_model)
-            if query and any_model:
-                parent.setExpanded(True)
 
     def fetch_prices(self):
         self.refresh_prices.setEnabled(False)

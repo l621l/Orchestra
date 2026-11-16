@@ -17,7 +17,6 @@ install_packages() {
 }
 
 packages=()
-command -v git >/dev/null || packages+=(git)
 command -v python3 >/dev/null || packages+=(python3 python3-venv)
 if command -v apt-get >/dev/null && ! dpkg-query -W -f='${Status}\n' libxcb-cursor0 2>/dev/null | grep -qx 'install ok installed'; then
     packages+=(libxcb-cursor0)
