@@ -20,7 +20,50 @@ from orchestra_core.desktop.desktop_data import DesktopData
 
 @unittest.skipIf(QApplication is None, 'Install requirements-qt.txt for Qt tests')
 class QtDesktopTests(unittest.TestCase):
-    def test_catalog_checkboxes_filter_both_project_roles(self):
+    def test_task_prompt_arrows_keep_multiline_navigation_and_restore_draft(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QTextCursor
+        from PySide6.QtTest import QTest
+        from orchestra_qt import TaskPrompt
+
+        prompt = TaskPrompt()
+        prompt.set_history(['Recent task', 'Older task'])
+        prompt.setPlainText('First line\nSecond line')
+        prompt.moveCursor(QTextCursor.MoveOperation.End)
+        QTest.keyClick(prompt, Qt.Key.Key_Up)
+        self.assertEqual(prompt.textCursor().blockNumber(), 0)
+        self.assertEqual(prompt.toPlainText(), 'First line\nSecond line')
+        QTest.keyClick(prompt, Qt.Key.Key_Up)
+        self.assertEqual(prompt.toPlainText(), 'Recent task')
+        QTest.keyClick(prompt, Qt.Key.Key_Up)
+        self.assertEqual(prompt.toPlainText(), 'Older task')
+        QTest.keyClick(prompt, Qt.Key.Key_Down)
+        self.assertEqual(prompt.toPlainText(), 'Recent task')
+        QTest.keyClick(prompt, Qt.Key.Key_Down)
+        self.assertEqual(prompt.toPlainText(), 'First line\nSecond line')
+        prompt.close()
+
+    def test_pricing_remembers_a_model_per_provider(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data = DesktopData(Path(__file__).resolve().parents[1], temporary)
+            data.initialize()
+            dialog = SettingsDialog(None, data, global_only=True)
+            for provider, model in [('gpt', 'gpt-6-luna'), ('mimo', 'mimo-v2.6-pro')]:
+                dialog.writer_provider.setCurrentText(provider)
+                dialog.model.setCurrentText(model)
+            dialog.writer_provider.setCurrentText('gpt')
+            self.assertEqual(dialog.model.currentText(), 'gpt-6-luna')
+            dialog.save()
+            reopened = SettingsDialog(None, data, global_only=True)
+            try:
+                reopened.writer_provider.setCurrentText('gpt')
+                self.assertEqual(reopened.model.currentText(), 'gpt-6-luna')
+                reopened.writer_provider.setCurrentText('mimo')
+                self.assertEqual(reopened.model.currentText(), 'mimo-v2.6-pro')
+            finally:
+                reopened.close()
+
+    def test_catalog_checkboxes_filter_pricing_and_both_project_roles(self):
         from PySide6.QtCore import Qt
         from orchestra_core.workspace.project_data import SETTINGS, project_data_path
 
@@ -38,7 +81,15 @@ class QtDesktopTests(unittest.TestCase):
                         model = provider.child(index)
                         model.setCheckState(0, Qt.CheckState.Checked if model.text(0) == 'gpt-6.1-sol'
                                             else Qt.CheckState.Unchecked)
+            self.assertEqual(global_dialog.writer_provider.currentText(), 'gpt')
+            self.assertEqual([global_dialog.model.itemText(i) for i in range(global_dialog.model.count())],
+                             ['gpt-6.1-sol'])
             global_dialog.save()
+            reopened = SettingsDialog(None, data, global_only=True)
+            self.assertEqual(reopened.writer_provider.count(), 1)
+            self.assertEqual([reopened.model.itemText(i) for i in range(reopened.model.count())],
+                             ['gpt-6.1-sol'])
+            reopened.close()
             path = project_data_path(data.logs, Path(temporary)) / SETTINGS
             dialog = SettingsDialog(None, data, project_path=path)
             self.assertEqual(dialog.writer_provider.count(), 1)

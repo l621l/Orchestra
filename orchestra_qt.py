@@ -28,6 +28,7 @@ from orchestra_core.desktop.desktop_data import DesktopData
 from orchestra_core.workspace.interface_notes import atomic_text
 from orchestra_core.runtime.orchestra_app import OrchestraApp
 from orchestra_core.runtime.orchestra_config import completion_review_enabled, normalize_settings, project_configuration, set_completion_review
+from orchestra_core.runtime.turn_trace import TurnTrace
 from orchestra_core.workspace.tool_errors import ToolError
 from orchestra_core.workspace.project_usage import IGNORE_RULE, read_usage
 from orchestra_core.workspace.project_data import SETTINGS, preserve_legacy_checkout_changes, project_data_path
@@ -92,6 +93,52 @@ class OutputText(QPlainTextEdit):
         select.setEnabled(not self.document().isEmpty())
         select.setShortcut(QKeySequence.StandardKey.SelectAll)
         menu.exec(event.globalPos())
+
+
+class TaskPrompt(QPlainTextEdit):
+    def __init__(self):
+        super().__init__()
+        self.history = []
+        self.history_index = -1
+        self.history_draft = ''
+        self.textChanged.connect(self.reset_history_navigation)
+
+    def reset_history_navigation(self):
+        self.history_index = -1
+
+    def set_history(self, history):
+        self.history = history
+        self.reset_history_navigation()
+
+    def draft_text(self):
+        return self.history_draft if self.history_index >= 0 else self.toPlainText()
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if (not self.history or event.modifiers() not in (
+                Qt.KeyboardModifier.NoModifier, Qt.KeyboardModifier.KeypadModifier)
+                or key not in (Qt.Key.Key_Up, Qt.Key.Key_Down)):
+            return super().keyPressEvent(event)
+
+        older = key == Qt.Key.Key_Up
+        index = self.history_index
+        if index < 0:
+            cursor = self.textCursor()
+            if not older or cursor.hasSelection() or cursor.movePosition(QTextCursor.MoveOperation.Up):
+                return super().keyPressEvent(event)
+            self.history_draft = self.toPlainText()
+            if self.history_draft == self.history[0] and len(self.history) > 1:
+                index = 0
+
+        self.history_index = min(index + 1, len(self.history) - 1) if older else index - 1
+        text = self.history[self.history_index] if self.history_index >= 0 else self.history_draft
+        blocked = self.blockSignals(True)
+        try:
+            self.setPlainText(text)
+            self.moveCursor(QTextCursor.MoveOperation.End)
+        finally:
+            self.blockSignals(blocked)
+        event.accept()
 
 
 class ProjectFilesModel(QFileSystemModel):
@@ -171,6 +218,9 @@ class DesktopWindow(QMainWindow):
         self.task_prompts = self.preferences.setdefault('task_prompts', {})
         if not isinstance(self.task_prompts, dict):
             self.task_prompts = self.preferences['task_prompts'] = {}
+        self.task_prompt_history = self.preferences.setdefault('task_prompt_history', {})
+        if not isinstance(self.task_prompt_history, dict):
+            self.task_prompt_history = self.preferences['task_prompt_history'] = {}
         saved_workspace = saved_view.get('workspace')
         legacy_draft = saved_view.get('draft')
         if isinstance(saved_workspace, str) and saved_workspace and isinstance(legacy_draft, str) and legacy_draft.strip():
@@ -245,7 +295,8 @@ class DesktopWindow(QMainWindow):
         editor_layout = QVBoxLayout(editor)
         editor_layout.setContentsMargins(0, 0, 0, 0)
         stack.addWidget(editor)
-        self.prompt = QPlainTextEdit()
+        self.prompt = TaskPrompt()
+        self.prompt.setToolTip('Up/Down browse task history at the first line.')
         self.prompt.setPlaceholderText('Enter a task')
         editor_layout.addWidget(self.prompt, 1)
         actions = QHBoxLayout()
@@ -323,20 +374,31 @@ class DesktopWindow(QMainWindow):
         return project_data_path(self.data.logs, workspace).name
 
     def remember_task_prompt(self):
-        text = self.prompt.toPlainText()
+        text = self.prompt.draft_text()
         if self.workspace and text.strip():
             self.task_prompts[self.task_prompt_key(self.workspace)] = text
 
     def restore_task_prompt(self):
+        history = self.task_history()
+        self.prompt.set_history(history)
         text = ''
         if self.workspace:
             key = self.task_prompt_key(self.workspace)
             text = self.task_prompts.get(key, '')
             if not isinstance(text, str) or not text.strip():
-                requests = (summary.get('request') for _, summary in self.project_history.get(str(self.workspace), ()))
-                text = next((request for request in requests if isinstance(request, str)
-                             and request.strip() and request not in {'continue', 'review'}), '')
+                text = history[0] if history else ''
         self.prompt.setPlainText(text)
+
+    def task_history(self):
+        if not self.workspace:
+            return []
+        records = self.task_prompt_history.get(self.task_prompt_key(self.workspace), [])
+        saved = [text for text in records if isinstance(text, str) and text.strip()] if isinstance(records, list) else []
+        previews = {TurnTrace.preview(text) for text in saved}
+        requests = (summary.get('request') for _, summary in self.project_history.get(str(self.workspace), ()))
+        previous = (text for text in requests if isinstance(text, str) and text.strip()
+                    and text not in previews and text not in {'continue', 'review'})
+        return list(dict.fromkeys((*saved, *previous)))[:100]
 
     def select_workspace(self, workspace):
         if workspace != self.workspace:
@@ -921,7 +983,14 @@ class DesktopWindow(QMainWindow):
             options = app.engine.settings.get('tools', {})
             if not self.ensure_git_author(options) or not self.ensure_git_push(app.engine, options):
                 return
-            self.remember_task_prompt()
+            if text:
+                key = self.task_prompt_key(self.workspace)
+                previous = self.task_prompt_history.get(key, [])
+                if not isinstance(previous, list):
+                    previous = []
+                self.task_prompt_history[key] = [text, *(item for item in previous if item != text)][:100]
+                self.task_prompts[key] = self.prompt.toPlainText()
+                self.prompt.set_history(self.task_history())
             self.data.save_preferences(self.preferences)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             QMessageBox.warning(self, 'Orchestra', str(error))

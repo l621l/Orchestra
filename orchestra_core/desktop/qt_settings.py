@@ -78,6 +78,8 @@ class SettingsDialog(QDialog):
         self.config = (json.loads(data.config.read_text(encoding='utf-8'))
                        if data.config.exists() else copy.deepcopy(DEFAULT_CONFIG))
         self.config, self.settings = project_configuration(project_path, self.config, self.settings)
+        saved_choices = self.config.get('pricing_model_selection', {})
+        self.pricing_choices = dict(saved_choices) if isinstance(saved_choices, dict) else {}
         for name, provider in DEFAULT_CONFIG['providers'].items():
             self.config['providers'].setdefault(name, copy.deepcopy(provider))
         self.pricing_path = data.root / 'pricing.json'
@@ -145,7 +147,8 @@ class SettingsDialog(QDialog):
         if self.catalog_filter is None and self.model.findText(writer['model']) < 0:
             self.model.addItem(writer['model'])
         self.writer_provider.setCurrentIndex(self.writer_provider.findText(writer['provider']))
-        self.model.setCurrentIndex(self.model.findText(writer['model']))
+        initial_model = self.pricing_choices.get(writer['provider'], writer['model']) if global_only else writer['model']
+        self.model.setCurrentIndex(self.model.findText(initial_model))
         self.thinking = QCheckBox('Enable model reasoning (Chat Completions)')
         self.thinking.setChecked(writer.get('thinking', 'enabled') == 'enabled')
         self.stream = QCheckBox('Show model reasoning as it streams')
@@ -159,7 +162,7 @@ class SettingsDialog(QDialog):
         pricing_form = QFormLayout(self.pricing_group)
         self.rate_fields = {}
         for key, label in (
-            ('input_cache_miss', 'Uncached input'),
+            ('input_cache_miss', 'Input'),
             ('input_cache_hit', 'Cached input'),
             ('input_cache_write', 'Cache write (optional)'),
             ('output', 'Output'),
@@ -257,7 +260,8 @@ class SettingsDialog(QDialog):
         selection = self.catalog_filter.get(provider, {})
         if not selection.get('enabled'):
             return []
-        return [model for model in selection.get('models', []) if model in self.catalog.get(provider, {})]
+        return [model for model in selection.get('models', [])
+                if self.global_only or model in self.catalog.get(provider, {})]
 
     def add_catalog_tab(self):
         page = QWidget()
@@ -306,6 +310,27 @@ class SettingsDialog(QDialog):
 
     def mark_catalog_selection_edited(self, *_):
         self.catalog_selection_edited = True
+        self.refresh_catalog_picker()
+
+    def refresh_catalog_picker(self):
+        previous_provider = self.writer_provider.currentText()
+        previous_model = self.model.currentText()
+        self.remember_rates()
+        self.rate_selection = None
+        self.catalog_filter = self.catalog_selection()
+        providers = [name for name in self.config['providers'] if self.allowed_models(name)]
+        blocked = self.writer_provider.blockSignals(True)
+        try:
+            self.writer_provider.clear()
+            self.writer_provider.addItems(providers)
+            if previous_provider in providers:
+                self.writer_provider.setCurrentText(previous_provider)
+        finally:
+            self.writer_provider.blockSignals(blocked)
+        self.update_models(self.writer_provider.currentText())
+        if previous_provider == self.writer_provider.currentText() and self.model.findText(previous_model) >= 0:
+            self.model.setCurrentText(previous_model)
+        self.show_model_rates()
 
     def render_catalog(self, selection, changes=None):
         blocked = self.catalog_tree.blockSignals(True)
@@ -354,6 +379,7 @@ class SettingsDialog(QDialog):
             parent.setExpanded(provider in DEFAULT_SELECTED or settings.get('enabled', False))
         self.catalog_tree.blockSignals(blocked)
         self.search_catalog(self.catalog_search.text())
+        self.refresh_catalog_picker()
 
     def search_catalog(self, text):
         query = text.strip().casefold()
@@ -392,10 +418,7 @@ class SettingsDialog(QDialog):
             changes = {(provider, model): before.get(provider, {}).get(model)
                        for provider, models in self.catalog.items() for model, rates in models.items()
                        if rates != before.get(provider, {}).get(model)}
-            model = self.model.currentText()
             self.rate_selection = None
-            self.update_models(self.writer_provider.currentText())
-            self.model.setCurrentText(model)
             filtered = self.catalog_selection_edited or self.config.get('model_filter') is not None
             self.render_catalog(selection if filtered else None, changes)
             count = len(self.pricing['catalog_providers'])
@@ -509,6 +532,8 @@ class SettingsDialog(QDialog):
         self.remember_rates()
         provider = self.writer_provider.currentText()
         model = self.model.currentText()
+        if self.global_only and provider and model:
+            self.pricing_choices[provider] = model
         self.rate_selection = (provider, model) if model else None
         title = f'{provider} / {model} — USD per million tokens' if model else 'Model pricing'
         self.pricing_group.setTitle(title.replace('&', '&&'))
@@ -520,7 +545,7 @@ class SettingsDialog(QDialog):
     def collect_rates(self, provider, model):
         self.remember_rates()
         drafts = dict(self.rate_drafts)
-        if model not in self.catalog.get(provider, {}):
+        if not self.global_only and model not in self.catalog.get(provider, {}):
             drafts.setdefault((provider, model), {})
         updates = {}
         for (name, model_id), values in drafts.items():
@@ -568,17 +593,17 @@ class SettingsDialog(QDialog):
         return combo
 
     def update_models(self, provider):
+        preferred = self.pricing_choices.get(provider) if self.global_only else None
         self.model.clear()
         if self.catalog_filter is not None:
-            self.model.addItems(self.allowed_models(provider))
-            return
-        drafts = (model for name, model in getattr(self, 'rate_drafts', {}) if name == provider)
-        discovered = ()
-        if self.global_only:
-            catalog_id = DIRECT_PROVIDERS.get(provider, (provider, None))[0]
-            discovered = self.pricing.get('catalog_providers', {}).get(catalog_id, {}).get('models', {})
-        self.model.addItems(list(dict.fromkeys((*MODEL_PRESETS.get(provider, ()),
-                                               *self.catalog.get(provider, {}), *discovered, *drafts))))
+            models = self.allowed_models(provider)
+        else:
+            drafts = (model for name, model in getattr(self, 'rate_drafts', {}) if name == provider)
+            models = list(dict.fromkeys((*MODEL_PRESETS.get(provider, ()),
+                                        *self.catalog.get(provider, {}), *drafts)))
+        self.model.addItems(models)
+        if preferred in models:
+            self.model.setCurrentText(preferred)
 
     def update_review_models(self, preferred=None):
         provider = self.review_provider.currentText()
@@ -640,6 +665,7 @@ class SettingsDialog(QDialog):
                 if (self.catalog_selection_edited or self.config.get('model_filter') is not None
                         or self.pricing.get('catalog_providers')):
                     self.config['model_filter'] = self.catalog_selection()
+                self.config['pricing_model_selection'] = self.pricing_choices
                 self.save_shared(settings)
                 self.accept()
                 return
