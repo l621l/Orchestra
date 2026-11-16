@@ -210,6 +210,44 @@ class QtDesktopTests(unittest.TestCase):
             finally:
                 restored.close()
 
+    def test_task_prompt_follows_project_and_survives_restart(self):
+        with tempfile.TemporaryDirectory() as temporary, asyncio.Runner() as runner:
+            root = Path(temporary)
+            data = DesktopData(Path(__file__).resolve().parents[1], root / 'data')
+            data.initialize()
+            first, second = root / 'first', root / 'second'
+            first.mkdir()
+            second.mkdir()
+            data.save_preferences({'workspaces': [str(first), str(second)]})
+
+            def select(window, project):
+                item = next(window.projects.topLevelItem(index)
+                            for index in range(window.projects.topLevelItemCount())
+                            if window.projects.topLevelItem(index).toolTip(1) == str(project))
+                window.projects.setCurrentItem(item)
+
+            window = DesktopWindow(data, runner.get_loop(), first)
+            try:
+                window.prompt.setPlainText('First task\nMore detail')
+                select(window, second)
+                self.assertEqual(window.prompt.toPlainText(), '')
+                window.prompt.setPlainText('Second draft')
+                select(window, first)
+                self.assertEqual(window.prompt.toPlainText(), 'First task\nMore detail')
+                window.prompt.clear()
+                select(window, second)
+                self.assertEqual(window.prompt.toPlainText(), 'Second draft')
+            finally:
+                window.close()
+
+            restored = DesktopWindow(data, runner.get_loop())
+            try:
+                self.assertEqual(restored.prompt.toPlainText(), 'Second draft')
+                select(restored, first)
+                self.assertEqual(restored.prompt.toPlainText(), 'First task\nMore detail')
+            finally:
+                restored.close()
+
     def test_git_graph_selects_commit_under_label(self):
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtTest import QTest

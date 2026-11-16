@@ -168,6 +168,13 @@ class DesktopWindow(QMainWindow):
         saved_view = self.preferences.get('window_view', {})
         if not isinstance(saved_view, dict):
             saved_view = {}
+        self.task_prompts = self.preferences.setdefault('task_prompts', {})
+        if not isinstance(self.task_prompts, dict):
+            self.task_prompts = self.preferences['task_prompts'] = {}
+        saved_workspace = saved_view.get('workspace')
+        legacy_draft = saved_view.get('draft')
+        if isinstance(saved_workspace, str) and saved_workspace and isinstance(legacy_draft, str) and legacy_draft.strip():
+            self.task_prompts.setdefault(self.task_prompt_key(saved_workspace), legacy_draft)
         if workspace is None and isinstance(saved_view.get('workspace'), str):
             workspace = saved_view['workspace']
         self.workspace = Path(workspace).resolve() if workspace else None
@@ -269,6 +276,7 @@ class DesktopWindow(QMainWindow):
         tabs.addTab(self.files_tab(), 'Project Files')
         self.reload_projects()
         self.restore_view(saved_view)
+        self.restore_task_prompt()
         self.refresh()
         fullscreen = QShortcut(QKeySequence('F11'), self)
         fullscreen.activated.connect(self.toggle_fullscreen)
@@ -289,9 +297,6 @@ class DesktopWindow(QMainWindow):
         tab = view.get('tab')
         if type(tab) is int and 0 <= tab < self.tabs.count():
             self.tabs.setCurrentIndex(tab)
-        draft = view.get('draft')
-        if isinstance(draft, str):
-            self.prompt.setPlainText(draft)
         expanded = view.get('expanded_projects')
         if isinstance(expanded, list):
             for index in range(self.projects.topLevelItemCount()):
@@ -299,12 +304,12 @@ class DesktopWindow(QMainWindow):
                 item.setExpanded(item.data(0, Qt.ItemDataRole.UserRole)[0] in expanded)
 
     def save_view(self):
+        self.remember_task_prompt()
         self.preferences['window_view'] = {
             'geometry': bytes(self.saveGeometry().toBase64()).decode('ascii'),
             'main_split': bytes(self.main_split.saveState().toBase64()).decode('ascii'),
             'task_split': bytes(self.task_split.saveState().toBase64()).decode('ascii'),
             'tab': self.tabs.currentIndex(),
-            'draft': self.prompt.toPlainText(),
             'workspace': str(self.workspace) if self.workspace else None,
             'expanded_projects': [
                 item.data(0, Qt.ItemDataRole.UserRole)[0]
@@ -313,6 +318,31 @@ class DesktopWindow(QMainWindow):
             ],
         }
         self.data.save_preferences(self.preferences)
+
+    def task_prompt_key(self, workspace):
+        return project_data_path(self.data.logs, workspace).name
+
+    def remember_task_prompt(self):
+        text = self.prompt.toPlainText()
+        if self.workspace and text.strip():
+            self.task_prompts[self.task_prompt_key(self.workspace)] = text
+
+    def restore_task_prompt(self):
+        text = ''
+        if self.workspace:
+            key = self.task_prompt_key(self.workspace)
+            text = self.task_prompts.get(key, '')
+            if not isinstance(text, str) or not text.strip():
+                requests = (summary.get('request') for _, summary in self.project_history.get(str(self.workspace), ()))
+                text = next((request for request in requests if isinstance(request, str)
+                             and request.strip() and request not in {'continue', 'review'}), '')
+        self.prompt.setPlainText(text)
+
+    def select_workspace(self, workspace):
+        if workspace != self.workspace:
+            self.remember_task_prompt()
+            self.workspace = workspace
+            self.restore_task_prompt()
 
     @staticmethod
     def button(layout, label, callback):
@@ -340,7 +370,7 @@ class DesktopWindow(QMainWindow):
             bar.setValue(bar.maximum())
 
     def reload_projects(self):
-        history = self.data.history()
+        history = self.project_history = self.data.history()
         hidden = set(self.preferences.get('hidden_workspaces', []))
         registered = self.preferences.get('workspaces', [])
         activity = self.preferences.get('workspace_activity', {})
@@ -400,7 +430,7 @@ class DesktopWindow(QMainWindow):
             workspace = Path(active.data(0, Qt.ItemDataRole.UserRole)[0])
         if workspace != self.workspace:
             self.store_run_view()
-            self.workspace = workspace
+            self.select_workspace(workspace)
             self.selected_run = None
             self.output.clear()
             self.reasoning.clear()
@@ -412,7 +442,7 @@ class DesktopWindow(QMainWindow):
             return
         self.store_run_view()
         path, self.selected_run = item.data(0, Qt.ItemDataRole.UserRole)
-        self.workspace = Path(path)
+        self.select_workspace(Path(path))
         self.output.clear()
         self.reasoning.clear()
         self.restore_run_view()
@@ -446,7 +476,7 @@ class DesktopWindow(QMainWindow):
             self.data.save_preferences(self.preferences)
             if self.workspace == Path(path):
                 self.store_run_view()
-                self.workspace = None
+                self.select_workspace(None)
                 self.selected_run = None
                 self.output.clear()
                 self.reasoning.clear()
@@ -552,7 +582,7 @@ class DesktopWindow(QMainWindow):
 
     def register_project(self, folder):
         self.store_run_view()
-        self.workspace = folder
+        self.select_workspace(folder)
         path = str(self.workspace)
         workspaces = self.preferences.setdefault('workspaces', [])
         if path not in workspaces:
@@ -891,6 +921,8 @@ class DesktopWindow(QMainWindow):
             options = app.engine.settings.get('tools', {})
             if not self.ensure_git_author(options) or not self.ensure_git_push(app.engine, options):
                 return
+            self.remember_task_prompt()
+            self.data.save_preferences(self.preferences)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             QMessageBox.warning(self, 'Orchestra', str(error))
             return
