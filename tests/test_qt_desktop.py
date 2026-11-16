@@ -20,6 +20,36 @@ from orchestra_core.desktop.desktop_data import DesktopData
 
 @unittest.skipIf(QApplication is None, 'Install requirements-qt.txt for Qt tests')
 class QtDesktopTests(unittest.TestCase):
+    def test_catalog_checkboxes_filter_both_project_roles(self):
+        from PySide6.QtCore import Qt
+        from orchestra_core.workspace.project_data import SETTINGS, project_data_path
+
+        with tempfile.TemporaryDirectory() as temporary:
+            data = DesktopData(Path(__file__).resolve().parents[1], temporary)
+            data.initialize()
+            global_dialog = SettingsDialog(None, data, global_only=True)
+            tree = global_dialog.catalog_tree
+            for row in range(tree.topLevelItemCount()):
+                provider = tree.topLevelItem(row)
+                provider.setCheckState(0, Qt.CheckState.Checked if provider.text(0) == 'gpt'
+                                       else Qt.CheckState.Unchecked)
+                if provider.text(0) == 'gpt':
+                    for index in range(provider.childCount()):
+                        model = provider.child(index)
+                        model.setCheckState(0, Qt.CheckState.Checked if model.text(0) == 'gpt-6.1-sol'
+                                            else Qt.CheckState.Unchecked)
+            global_dialog.save()
+            path = project_data_path(data.logs, Path(temporary)) / SETTINGS
+            dialog = SettingsDialog(None, data, project_path=path)
+            self.assertEqual(dialog.writer_provider.count(), 1)
+            self.assertEqual(dialog.writer_provider.currentIndex(), -1)
+            dialog.writer_provider.setCurrentText('gpt')
+            dialog.review_provider.setCurrentText('gpt')
+            self.assertEqual([dialog.model.itemText(i) for i in range(dialog.model.count())], ['gpt-6.1-sol'])
+            self.assertEqual([dialog.review_model.itemText(i) for i in range(dialog.review_model.count())],
+                             ['gpt-6.1-sol'])
+            dialog.close()
+
     def test_opening_click_release_does_not_select_a_combo_item(self):
         from PySide6.QtCore import QEvent, QPointF, Qt
         from PySide6.QtGui import QMouseEvent

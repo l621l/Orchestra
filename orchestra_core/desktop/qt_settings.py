@@ -4,15 +4,21 @@ import json
 import math
 from urllib.parse import urlsplit
 
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, Qt, QUrl
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QLineEdit,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHeaderView, QLineEdit,
     QInputDialog, QLabel, QMessageBox, QPlainTextEdit, QPushButton, QTabWidget, QVBoxLayout, QWidget,
+    QTreeWidget, QTreeWidgetItem,
 )
 
 from orchestra_core.desktop.desktop_options import DEFAULT_CONFIG, LIMITS, MODEL_PRESETS
 from orchestra_core.workspace.interface_notes import atomic_text
 from orchestra_core.models.model_routing import role_settings, reasoning_levels
+from orchestra_core.models.model_catalog import (
+    CATALOG_URL, DEFAULT_SELECTED, DIRECT_PROVIDERS, catalog_rates, default_selection, discover_providers,
+    update_prices,
+)
 from orchestra_core.runtime.orchestra_config import (
     completion_review_enabled, normalize_settings, project_configuration, project_settings_payload,
     set_completion_review, validate_settings,
@@ -66,7 +72,7 @@ class SettingsDialog(QDialog):
         self.project_path = project_path
         self.global_only = global_only
         self.setWindowTitle('Project Settings' if project_path else 'Orchestra Settings')
-        self.resize(570, 440)
+        self.resize(*(760, 520) if global_only else (570, 440))
         self.settings_path = data.root / 'settings.json'
         self.settings = normalize_settings(json.loads(self.settings_path.read_text(encoding='utf-8')))
         self.config = (json.loads(data.config.read_text(encoding='utf-8'))
@@ -78,8 +84,8 @@ class SettingsDialog(QDialog):
         self.pricing = json.loads(self.pricing_path.read_text(encoding='utf-8'))
         self.catalog = self.pricing['providers']
         self.pricing_changed = False
-        bundled = json.loads((data.source / 'pricing.json').read_text(encoding='utf-8'))
-        for provider, models in bundled['providers'].items():
+        self.bundled = json.loads((data.source / 'pricing.json').read_text(encoding='utf-8'))['providers']
+        for provider, models in self.bundled.items():
             catalog = self.catalog.setdefault(provider, {})
             for model, rates in models.items():
                 if model not in catalog:
@@ -88,6 +94,9 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         tabs = self.tabs = QTabWidget()
         layout.addWidget(tabs)
+        self.catalog_filter = self.config.get('model_filter') if project_path is not None else None
+        project_providers = [name for name in self.config['providers']
+                             if self.catalog_filter is None or self.allowed_models(name)]
 
         limits = self.form(tabs, 'Limits')
         self.limits = {}
@@ -105,9 +114,9 @@ class SettingsDialog(QDialog):
         review = QFormLayout(review_panel)
         review.setContentsMargins(0, 0, 0, 0)
         configured_reviewer = self.config['roles'].get('reviewer', {})
-        self.review_provider = self.combo(['Same as executor', *self.config['providers']])
-        if configured_reviewer.get('provider') in self.config['providers']:
-            self.review_provider.setCurrentText(configured_reviewer['provider'])
+        self.review_provider = self.combo(['Same as executor', *project_providers])
+        if configured_reviewer:
+            self.review_provider.setCurrentIndex(self.review_provider.findText(configured_reviewer.get('provider', '')))
         self.review_model = self.combo([])
         review.addRow('Review provider', self.review_provider)
         review.addRow('Review model', self.review_model)
@@ -129,20 +138,19 @@ class SettingsDialog(QDialog):
         self.review_enabled.toggled.connect(review_panel.setVisible)
 
         writer = role_settings(self.config, 'writer')
-        models = self.form(tabs, 'Model Catalog' if global_only else 'Models')
-        self.writer_provider = self.combo(self.config['providers'], writer['provider'])
+        models = self.form(tabs, 'Model Pricing' if global_only else 'Models')
+        self.writer_provider = self.combo(project_providers, writer['provider'])
         self.model = self.combo([])
         self.update_models(self.writer_provider.currentText())
-        if self.model.findText(writer['model']) < 0:
+        if self.catalog_filter is None and self.model.findText(writer['model']) < 0:
             self.model.addItem(writer['model'])
-        self.model.setCurrentText(writer['model'])
+        self.writer_provider.setCurrentIndex(self.writer_provider.findText(writer['provider']))
+        self.model.setCurrentIndex(self.model.findText(writer['model']))
         self.thinking = QCheckBox('Enable model reasoning (Chat Completions)')
         self.thinking.setChecked(writer.get('thinking', 'enabled') == 'enabled')
         self.stream = QCheckBox('Show model reasoning as it streams')
         self.stream.setToolTip('Applies to the executor and the Debug reviewer.')
         self.stream.setChecked(writer.get('stream_reasoning', writer['model'].lower() == 'gpt-6.1-sol') is True)
-        add_model = self.action('Add Model', self.add_model)
-        models.addRow(add_model)
         models.addRow('Provider' if global_only else 'Executor provider', self.writer_provider)
         models.addRow('Model', self.model)
         self.writer_effort = self.combo([])
@@ -198,8 +206,6 @@ class SettingsDialog(QDialog):
         providers.addRow('API key', self.key)
         providers.addRow('API timeout (seconds)', self.limits['api', 'timeout_seconds'])
 
-        providers.addRow(self.action('Add Provider', self.add_provider))
-
         git = self.form(tabs, 'Git')
         self.git_flags = {}
         for key, label in (
@@ -226,13 +232,13 @@ class SettingsDialog(QDialog):
 
         if project_path is not None:
             tabs.setTabVisible(tabs.indexOf(providers.parentWidget()), False)
-            models.setRowVisible(add_model, False)
             models.setRowVisible(self.pricing_group, False)
         elif global_only:
             for section in (limits, git):
                 tabs.setTabVisible(tabs.indexOf(section.parentWidget()), False)
             for field in (self.writer_effort, self.thinking, self.stream):
                 models.setRowVisible(field, False)
+            self.add_catalog_tab()
             tabs.setCurrentWidget(providers.parentWidget())
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -246,6 +252,159 @@ class SettingsDialog(QDialog):
         button = QPushButton(text)
         button.clicked.connect(callback)
         return button
+
+    def allowed_models(self, provider):
+        selection = self.catalog_filter.get(provider, {})
+        if not selection.get('enabled'):
+            return []
+        return [model for model in selection.get('models', []) if model in self.catalog.get(provider, {})]
+
+    def add_catalog_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.tabs.addTab(page, 'Model Catalog')
+        self.catalog_tree = QTreeWidget()
+        self.catalog_tree.setHeaderLabels(['Provider / model', 'Input', 'Output', 'Cache read', 'Cache write'])
+        header = self.catalog_tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in range(1, self.catalog_tree.columnCount()):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        self.catalog_tree.setToolTip(
+            'USD per million tokens. Check the providers and models to use. Double-click to configure a provider.')
+        self.catalog_tree.setExpandsOnDoubleClick(False)
+        self.catalog_tree.itemDoubleClicked.connect(self.configure_catalog_provider)
+        self.catalog_search = QLineEdit()
+        self.catalog_search.setPlaceholderText('Find a provider or model')
+        self.catalog_search.textChanged.connect(self.search_catalog)
+        layout.addWidget(self.catalog_search)
+        layout.addWidget(self.catalog_tree)
+        self.refresh_prices = self.action('Update prices', self.fetch_prices)
+        layout.addWidget(self.refresh_prices)
+        self.catalog_status = QLabel('Prices are in USD per million tokens.')
+        self.catalog_status.setWordWrap(True)
+        layout.addWidget(self.catalog_status)
+        self.network = QNetworkAccessManager(self)
+        self.catalog_selection_edited = False
+        self.render_catalog(self.config.get('model_filter'))
+        self.catalog_tree.itemChanged.connect(self.mark_catalog_selection_edited)
+        self.tabs.currentChanged.connect(self.refresh_catalog_on_first_visit)
+        self.catalog_page = page
+
+    def refresh_catalog_on_first_visit(self, index):
+        if (self.tabs.widget(index) == self.catalog_page and not self.pricing.get('catalog_providers')
+                and self.refresh_prices.isEnabled()):
+            self.fetch_prices()
+
+    def catalog_selection(self):
+        checked = Qt.CheckState.Checked
+        return {item.data(0, Qt.ItemDataRole.UserRole): {'enabled': item.checkState(0) == checked,
+                               'models': [item.child(i).text(0) for i in range(item.childCount())
+                                          if item.child(i).checkState(0) == checked]}
+                for row in range(self.catalog_tree.topLevelItemCount())
+                if (item := self.catalog_tree.topLevelItem(row))}
+
+    def mark_catalog_selection_edited(self, *_):
+        self.catalog_selection_edited = True
+
+    def render_catalog(self, selection, changes=None):
+        blocked = self.catalog_tree.blockSignals(True)
+        self.catalog_tree.clear()
+        checked, unchecked = Qt.CheckState.Checked, Qt.CheckState.Unchecked
+        discovered = self.pricing.get('catalog_providers', {})
+        if selection is None:
+            selection = default_selection(self.pricing)
+        configured = self.config['providers']
+        aliases = {value[0] for key, value in DIRECT_PROVIDERS.items() if key in configured}
+        providers = [*configured, *sorted(set(discovered) - aliases - configured.keys())]
+        for provider in providers:
+            catalog_id = DIRECT_PROVIDERS[provider][0] if provider in DIRECT_PROVIDERS else provider
+            block = discovered.get(catalog_id, {})
+            title = provider if provider in configured else f"{block.get('name', provider)} ({provider})"
+            parent = QTreeWidgetItem(self.catalog_tree, [title])
+            parent.setData(0, Qt.ItemDataRole.UserRole, provider)
+            if provider not in configured:
+                parent.setToolTip(0, 'Double-click to configure this provider.')
+            font = parent.font(0)
+            font.setBold(True)
+            parent.setFont(0, font)
+            settings = selection.get(provider, {})
+            parent.setCheckState(0, checked if settings.get('enabled') else unchecked)
+            specs = block.get('models', {})
+            names = set(self.catalog.get(provider, {})) | specs.keys()
+            names.update(model for name, model in self.rate_drafts if name == provider)
+            for model in sorted(names):
+                prices = self.catalog.get(provider, {}).get(model)
+                shown_prices = prices if prices is not None else catalog_rates(specs.get(model, {}))
+                fields = ('input_cache_miss', 'output', 'input_cache_hit', 'input_cache_write')
+                values = [str(shown_prices.get(key, '—')) for key in fields]
+                row = QTreeWidgetItem(parent, [model, *values])
+                row.setCheckState(0, checked if model in settings.get('models', []) else unchecked)
+                updated = self.pricing.get('catalog_updated', {}).get(provider, {}).get(model)
+                detail = f'Models.dev · {updated}' if updated else (
+                    'Local price' if prices is not None else 'Models.dev · catalog listing')
+                if specs.get(model, {}).get('status') == 'deprecated':
+                    detail += '\nDeprecated'
+                if changes and (provider, model) in changes:
+                    detail += '\nPrevious rates: ' + str(changes[provider, model] or 'new model')
+                    row.setText(1, values[0] + ' *')
+                row.setToolTip(0, detail)
+                for column in range(1, self.catalog_tree.columnCount()):
+                    row.setTextAlignment(column, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            parent.setExpanded(provider in DEFAULT_SELECTED or settings.get('enabled', False))
+        self.catalog_tree.blockSignals(blocked)
+        self.search_catalog(self.catalog_search.text())
+
+    def search_catalog(self, text):
+        query = text.strip().casefold()
+        for index in range(self.catalog_tree.topLevelItemCount()):
+            parent = self.catalog_tree.topLevelItem(index)
+            matches_provider = query in parent.text(0).casefold()
+            any_model = False
+            for row in range(parent.childCount()):
+                child = parent.child(row)
+                matches = matches_provider or query in child.text(0).casefold()
+                child.setHidden(not matches)
+                any_model |= matches
+            parent.setHidden(not matches_provider and not any_model)
+            if query and any_model:
+                parent.setExpanded(True)
+
+    def fetch_prices(self):
+        self.refresh_prices.setEnabled(False)
+        self.catalog_status.setText('Downloading Models.dev prices…')
+        request = QNetworkRequest(QUrl(CATALOG_URL))
+        request.setTransferTimeout(15000)
+        reply = self.network.get(request)
+        reply.finished.connect(lambda: self.prices_received(reply))
+
+    def prices_received(self, reply):
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                raise ValueError(reply.errorString())
+            raw = json.loads(bytes(reply.readAll()))
+            before = copy.deepcopy(self.catalog)
+            selection = self.catalog_selection()
+            self.remember_rates()
+            _, changed = update_prices(self.pricing, raw, self.config['providers'], self.bundled)
+            self.pricing['catalog_providers'] = discover_providers(raw)
+            self.pricing_changed = True
+            changes = {(provider, model): before.get(provider, {}).get(model)
+                       for provider, models in self.catalog.items() for model, rates in models.items()
+                       if rates != before.get(provider, {}).get(model)}
+            model = self.model.currentText()
+            self.rate_selection = None
+            self.update_models(self.writer_provider.currentText())
+            self.model.setCurrentText(model)
+            filtered = self.catalog_selection_edited or self.config.get('model_filter') is not None
+            self.render_catalog(selection if filtered else None, changes)
+            count = len(self.pricing['catalog_providers'])
+            self.catalog_status.setText(f'Models.dev · {count} providers · {changed} new or updated prices (*).')
+        except (ValueError, TypeError, AttributeError) as error:
+            self.catalog_status.setText(f'Could not update prices. {error}')
+        finally:
+            self.refresh_prices.setEnabled(True)
+            reply.deleteLater()
 
     def update_reasoning(self, *_):
         for role, field, provider, model in (
@@ -284,11 +443,16 @@ class SettingsDialog(QDialog):
             'Input and output both count. Output limits shrink to fit the estimated remaining funds. '
             'Token estimates can differ from actual billing; unused reserve is not a spending target.')
 
-    def add_provider(self):
-        name, accepted = QInputDialog.getText(self, 'Provider', 'Provider name')
-        name = name.strip().lower()
-        if not accepted:
-            return
+    def configure_catalog_provider(self, item, _column):
+        parent = item.parent() or item
+        name = parent.data(0, Qt.ItemDataRole.UserRole)
+        if name in self.config['providers']:
+            self.provider.setCurrentText(name)
+            self.tabs.setCurrentWidget(self.provider.parentWidget())
+        else:
+            self.configure_provider(name)
+
+    def configure_provider(self, name):
         if not name or name in self.config['providers']:
             QMessageBox.warning(self, 'Provider', 'Enter a unique name.')
             return
@@ -296,7 +460,9 @@ class SettingsDialog(QDialog):
             self, 'Provider', 'Compatible API', ['chat', 'responses'], editable=False)
         if not accepted:
             return
-        url, accepted = QInputDialog.getText(self, 'Provider', 'API base URL')
+        discovered = self.pricing.get('catalog_providers', {})
+        endpoint = discovered.get(name, {}).get('api', '')
+        url, accepted = QInputDialog.getText(self, 'Provider', 'API base URL', text=endpoint)
         if not accepted:
             return
         if not self.valid_address(url.strip()):
@@ -307,6 +473,16 @@ class SettingsDialog(QDialog):
         self.writer_provider.addItem(name)
         self.review_provider.addItem(name)
         self.provider.setCurrentText(name)
+        if self.global_only:
+            selection = self.catalog_selection()
+            selection.setdefault(name, {'enabled': False, 'models': []})['enabled'] = True
+            self.catalog_selection_edited = True
+            if discovered:
+                matched, _ = update_prices(self.pricing, discovered, {name: self.config['providers'][name]},
+                                           self.bundled)
+                self.pricing_changed |= bool(matched)
+            self.render_catalog(selection)
+            self.tabs.setCurrentWidget(self.provider.parentWidget())
 
     @staticmethod
     def valid_address(address):
@@ -315,20 +491,6 @@ class SettingsDialog(QDialog):
             return url.scheme in {'http', 'https'} and bool(url.hostname) and not (url.username or url.password)
         except ValueError:
             return False
-
-    def add_model(self):
-        provider = self.writer_provider.currentText()
-        model, accepted = QInputDialog.getText(
-            self, 'Model', f'API model ID ({provider})')
-        model = model.strip()
-        if not accepted or not model:
-            return
-        if self.model.findText(model) < 0:
-            self.rate_drafts.setdefault((provider, model), {})
-            self.model.addItem(model)
-        self.model.setCurrentText(model)
-        self.update_review_models()
-        self.rate_fields['input_cache_miss'].setFocus()
 
     def remember_rates(self):
         if self.rate_selection is None:
@@ -385,6 +547,9 @@ class SettingsDialog(QDialog):
             updates[name, model_id] = rates
         for (name, model_id), rates in updates.items():
             self.catalog.setdefault(name, {})[model_id] = rates
+            manual = self.pricing.setdefault('manual_rates', {}).setdefault(name, [])
+            if model_id not in manual:
+                manual.append(model_id)
         self.pricing_changed |= bool(updates)
 
     @staticmethod
@@ -404,9 +569,16 @@ class SettingsDialog(QDialog):
 
     def update_models(self, provider):
         self.model.clear()
+        if self.catalog_filter is not None:
+            self.model.addItems(self.allowed_models(provider))
+            return
         drafts = (model for name, model in getattr(self, 'rate_drafts', {}) if name == provider)
+        discovered = ()
+        if self.global_only:
+            catalog_id = DIRECT_PROVIDERS.get(provider, (provider, None))[0]
+            discovered = self.pricing.get('catalog_providers', {}).get(catalog_id, {}).get('models', {})
         self.model.addItems(list(dict.fromkeys((*MODEL_PRESETS.get(provider, ()),
-                                               *self.catalog.get(provider, {}), *drafts))))
+                                               *self.catalog.get(provider, {}), *discovered, *drafts))))
 
     def update_review_models(self, preferred=None):
         provider = self.review_provider.currentText()
@@ -416,9 +588,11 @@ class SettingsDialog(QDialog):
         self.review_model.clear()
         if separate:
             drafts = (model for name, model in self.rate_drafts if name == provider)
-            self.review_model.addItems(list(dict.fromkeys(
+            names = (self.allowed_models(provider) if self.catalog_filter is not None else list(dict.fromkeys(
                 (*self.catalog.get(provider, {}), *MODEL_PRESETS.get(provider, ()), *drafts))))
-            self.review_model.setCurrentText(preferred)
+            self.review_model.addItems(names)
+            if preferred:
+                self.review_model.setCurrentIndex(self.review_model.findText(preferred))
         self.update_review_cost()
 
     def load_provider(self):
@@ -463,6 +637,9 @@ class SettingsDialog(QDialog):
                 self.remember_rates()
                 if self.rate_drafts:
                     self.collect_rates(self.writer_provider.currentText(), self.model.currentText())
+                if (self.catalog_selection_edited or self.config.get('model_filter') is not None
+                        or self.pricing.get('catalog_providers')):
+                    self.config['model_filter'] = self.catalog_selection()
                 self.save_shared(settings)
                 self.accept()
                 return
@@ -479,7 +656,7 @@ class SettingsDialog(QDialog):
             provider = self.writer_provider.currentText()
             model = self.model.currentText().strip()
             if not model:
-                raise ValueError('Choose a model for ' + provider + '.')
+                raise ValueError('Choose an executor from the models enabled in Global Settings.')
             address = self.config['providers'][provider].get('base_url')
             if (address or provider not in DEFAULT_CONFIG['providers']) and not self.valid_address(address):
                 raise ValueError('Check the API URL for ' + provider + '.')
@@ -495,6 +672,8 @@ class SettingsDialog(QDialog):
                 self.collect_rates(provider, model)
             elif model not in self.catalog.get(provider, {}):
                 raise ValueError(f'Add prices for {provider} / {model} in Global Settings.')
+            if self.review_provider.currentIndex() < 0:
+                raise ValueError('Choose a reviewer from the models enabled in Global Settings.')
             if self.review_provider.currentIndex() > 0:
                 reviewer_provider = self.review_provider.currentText()
                 reviewer_model = self.review_model.currentText()

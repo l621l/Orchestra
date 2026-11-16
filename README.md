@@ -42,7 +42,7 @@ python3 -m venv .venv
 
 ### First run
 
-1. In **Global Settings**, configure a provider, its API key, and model prices.
+1. In **Global Settings → Model Catalog**, check the providers and models you want to use. Double-click a provider to configure its connection and API key. Edit custom rates under **Model Pricing**.
 2. Create or add a project. In **Project Settings**, select the executor and reviewer, set limits, and configure Git permissions.
 3. Start a task. Switch projects to run another task in parallel. Use **Continue** to resume a saved task or **Debug Only** to review an existing project.
 
@@ -62,13 +62,3 @@ python -B orchestra.py --workspace /path/to/project
 Use `N: <task>` for a new task, `C` to continue, `S` for status, and `Q` to quit. Pass `--data-dir` to use the desktop app's settings and history.
 
 Desktop data lives in `%LOCALAPPDATA%\Orchestra` on Windows and `~/.local/share/Orchestra` on Linux by default.
-
-## Tests
-
-Install `requirements-qt.txt` to include the Qt tests, then run:
-
-```bash
-python -B -m unittest discover -q
-```
-
-Tests run without live model calls.

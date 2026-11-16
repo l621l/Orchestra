@@ -473,6 +473,13 @@ class DirectDevelopment(Orchestra):
     async def request_executor(self, selected, reason, messages, tools, resource_status,
                                usage, trace, task_id, force_final, **kwargs):
         config = self.role_settings(selected)
+        model_filter = self.config.get('model_filter')
+        if model_filter is not None:
+            provider = model_filter.get(config['provider'], {})
+            if not provider.get('enabled') or config['model'] not in provider.get('models', ()):
+                raise ModelResponseError(
+                    f"{config['provider']} / {config['model']} is disabled in Global Settings. "
+                    "Choose an enabled model in Project Settings.")
         resource_status += '\nContinue the task with tools. Return actual changes, checks and remaining work.'
         compacted = self.fit_history(messages, tools, resource_status, force_final,
                                      kwargs.get('max_output_tokens'))
